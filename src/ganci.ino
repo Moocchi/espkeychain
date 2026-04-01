@@ -655,6 +655,9 @@
     } else {
       canvas.println("PSR: Not Detected");
     }
+    
+    float espTemp = temperatureRead();
+    canvas.printf("TMP:%.1f C\n", espTemp);
 
     if (waitForKey) {
         canvas.setCursor(0, 50);
@@ -1030,6 +1033,7 @@ void runRealtimeClock() {
       float freeFS = totalFS - usedFS;
       float totalRAM = ESP.getHeapSize() / 1024.0;
       float freeRAM = ESP.getFreeHeap() / 1024.0;
+      float espTempC = temperatureRead();
       
       String json = "{";
       json += "\"status\":\"ok\",";
@@ -1037,7 +1041,8 @@ void runRealtimeClock() {
       json += "\"fs_used_mb\":" + String(usedFS, 2) + ",";
       json += "\"fs_free_mb\":" + String(freeFS, 2) + ",";
       json += "\"ram_total_kb\":" + String(totalRAM, 2) + ",";
-      json += "\"ram_free_kb\":" + String(freeRAM, 2);
+      json += "\"ram_free_kb\":" + String(freeRAM, 2) + ",";
+      json += "\"temp_c\":" + String(espTempC, 2);
       json += "}";
       sendJsonResponse(200, json);
   }
@@ -1059,6 +1064,39 @@ void runRealtimeClock() {
       sendJsonResponse(200, json);
   }
 
+  void recursiveDelete(String path) {
+      File dir = LittleFS.open(path);
+      if (!dir) return;
+      if (!dir.isDirectory()) {
+          dir.close();
+          LittleFS.remove(path);
+          return;
+      }
+      
+      File file = dir.openNextFile();
+      while (file) {
+          String childPath = String(file.name());
+          if (!childPath.startsWith(path)) {
+              if (path.endsWith("/")) childPath = path + childPath;
+              else childPath = path + "/" + childPath;
+          }
+          bool isDir = file.isDirectory();
+          file.close();
+
+          if (isDir) {
+              recursiveDelete(childPath);
+          } else {
+              LittleFS.remove(childPath);
+          }
+          
+          dir = LittleFS.open(path); 
+          if (!dir) break;
+          file = dir.openNextFile(); 
+      }
+      dir.close();
+      LittleFS.rmdir(path);
+  }
+
   void handleDelete() {
       if (!server.hasArg("path")) {
           sendJsonResponse(400, "{\"error\":\"missing path\"}");
@@ -1068,10 +1106,22 @@ void runRealtimeClock() {
       if (!path.startsWith("/")) path = "/" + path;
       
       if (LittleFS.exists(path)) {
-          if (LittleFS.remove(path) || LittleFS.rmdir(path)) {
+          File f = LittleFS.open(path, "r");
+          bool isDir = false;
+          if (f) {
+              isDir = f.isDirectory();
+              f.close();
+          }
+          
+          if (isDir) {
+              recursiveDelete(path);
               sendJsonResponse(200, "{\"status\":\"deleted\"}");
           } else {
-              sendJsonResponse(500, "{\"error\":\"delete failed\"}");
+              if (LittleFS.remove(path)) {
+                  sendJsonResponse(200, "{\"status\":\"deleted\"}");
+              } else {
+                  sendJsonResponse(500, "{\"error\":\"delete failed\"}");
+              }
           }
       } else {
           sendJsonResponse(404, "{\"error\":\"not found\"}");
@@ -1128,6 +1178,11 @@ void runRealtimeClock() {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_AP);
       
+      // OPTIMASI: Kencangkan transfer rate WiFi mentok!
+      esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+      WiFi.setSleep(false);
+      WiFi.setTxPower(WIFI_POWER_19_5dBm);
+      
       // Configure explicit IP to prevent DHCP issues on some phones
       IPAddress apIP(192, 168, 4, 1);
       WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
@@ -1146,12 +1201,6 @@ void runRealtimeClock() {
       server.on("/upload", HTTP_POST, []() {
           sendJsonResponse(200, "{\"status\":\"success\"}");
       }, handleFileUpload);
-      
-      server.on("/reboot", HTTP_POST, []() {
-          sendJsonResponse(200, "{\"status\":\"rebooting\"}");
-          delay(500);
-          ESP.restart();
-      });
 
       server.onNotFound([]() {
           sendJsonResponse(404, "{\"error\":\"not found\"}");
