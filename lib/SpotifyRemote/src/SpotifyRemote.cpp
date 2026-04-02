@@ -209,6 +209,60 @@ void SpotifyRemoteClass::end() {
 static void drawPlayerUI(Adafruit_GFX* display) {
   display->fillScreen(COLOR_BG);
   display->setTextWrap(false);
+
+  // ─── 1. DRAW LYRICS FIRST ───
+  if (currentView == VIEW_PLAYER) {
+    display->setTextSize(1);
+    display->setTextColor(COLOR_FG);
+
+    auto drawWrapped = [&](const char* text, int yOffset) {
+        char buf[64];
+        strncpy(buf, text, 63); buf[63] = '\0';
+        int len = strlen(buf);
+        
+        // Handle Ellipsis for very long lyrics
+        if (len > 55) {
+            strcpy(buf + 52, "...");
+            len = 55;
+        }
+
+        if (len <= 28) {
+            display->setCursor(30, yOffset);
+            display->print(buf);
+        } else {
+            int split = 28;
+            for (int i = 28; i > 10; i--) {
+                if (buf[i] == ' ') { split = i; break; }
+            }
+            char line1[35] = {0};
+            strncpy(line1, buf, split);
+            display->setCursor(30, yOffset - 5);
+            display->print(line1);
+
+            char line2[35] = {0};
+            strncpy(line2, buf + split + 1, 28);
+            if (strlen(buf + split + 1) > 28) strcat(line2, "...");
+            display->setCursor(30, yOffset + 7);
+            display->print(line2);
+        }
+    };
+
+    if (lyricAnimY > 0.0f && strlen(outgoingLyric) > 0 && strcmp(outgoingLyric, "No lyrics") != 0) {
+        int drawY_old = 115 - (25 - (int)lyricAnimY);
+        drawWrapped(outgoingLyric, drawY_old);
+    }
+
+    if (strlen(currentLyric) > 0 && strcmp(currentLyric, "No lyrics") != 0) {
+        int drawY_new = 115 + (int)lyricAnimY;
+        drawWrapped(currentLyric, drawY_new);
+    }
+  }
+
+  // ─── 2. MASK THE OVERFLOW LYRICS ───
+  display->fillRect(0, 0, SCREEN_W, 99, COLOR_BG); 
+  display->fillRect(0, 133, SCREEN_W, 107, COLOR_BG);
+
+  // ─── 3. DRAW UI ON TOP ───
   display->setTextSize(1);
   display->setTextColor(COLOR_FG);
 
@@ -256,58 +310,6 @@ static void drawPlayerUI(Adafruit_GFX* display) {
     if (ax < 0) ax = 0;
     display->setCursor(ax, 90);
     display->print(songArtist);
-
-    // Draw active lyric line above progress bar with push-up animation
-    display->setTextSize(1);
-    display->setTextColor(COLOR_FG);
-
-    auto drawWrapped = [&](const char* text, int yOffset) {
-        char buf[64];
-        strncpy(buf, text, 63); buf[63] = '\0';
-        int len = strlen(buf);
-        
-        // Handle Ellipsis for very long lyrics
-        if (len > 55) {
-            strcpy(buf + 52, "...");
-            len = 55;
-        }
-
-        if (len <= 28) {
-            display->setCursor(30, yOffset);
-            display->print(buf);
-        } else {
-            int split = 28;
-            for (int i = 28; i > 10; i--) {
-                if (buf[i] == ' ') { split = i; break; }
-            }
-            char line1[35] = {0};
-            strncpy(line1, buf, split);
-            display->setCursor(30, yOffset - 5);
-            display->print(line1);
-
-            char line2[35] = {0};
-            strncpy(line2, buf + split + 1, 28);
-            if (strlen(buf + split + 1) > 28) strcat(line2, "...");
-            display->setCursor(30, yOffset + 7);
-            display->print(line2);
-        }
-    };
-
-    if (lyricAnimY > 0.0f && strlen(outgoingLyric) > 0 && strcmp(outgoingLyric, "No lyrics") != 0) {
-        int drawY_old = 115 - (15 - (int)lyricAnimY);
-        drawWrapped(outgoingLyric, drawY_old);
-    }
-
-    if (strlen(currentLyric) > 0 && strcmp(currentLyric, "No lyrics") != 0) {
-        int drawY_new = 115 + (int)lyricAnimY;
-        drawWrapped(currentLyric, drawY_new);
-    }
-
-    // MASKING: Draw black cover bars to make lyrics "disappear" into the background
-    // Covers above the lyric area (Artist ends at ~98)
-    display->fillRect(0, 98, SCREEN_W, 12, COLOR_BG); 
-    // Covers below the lyric area (Bar starts at 140)
-    display->fillRect(0, 133, SCREEN_W, 7, COLOR_BG);
   }
 
   uint32_t dur = (songDuration > 0) ? songDuration : 1;
@@ -428,11 +430,11 @@ bool SpotifyRemoteClass::update(int btnAction, Adafruit_GFX* display) {
       strncpy(outgoingLyric, currentLyric, 63);
       strncpy(currentLyric, lyricActive, 63);
       currentLyric[63] = '\0';
-      lyricAnimY = 15.0f; // Start 15 pixels below
+      lyricAnimY = 25.0f; // Increased from 15 to 25 to separate 2-line lyrics
   }
   
   if (lyricAnimY > 0.0f) {
-      lyricAnimY -= 1.0f; // Fast Slide up (1.0 px per frame)
+      lyricAnimY -= 1.5f; // Fast slide up to account for larger distance
       if (lyricAnimY < 0.0f) lyricAnimY = 0.0f;
   }
 
