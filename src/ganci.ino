@@ -8,6 +8,8 @@
   #include <WebServer.h>      // NEW: WebServer for Web UI
   #include <Adafruit_GFX.h>
   #include <Adafruit_GC9A01A.h>
+  #include <lvgl.h>
+  #include "ui/lvgl_clock.h"
   #include <Fonts/FreeSansBold12pt7b.h>
   #include "ntp_time.h"
   #include <esp_heap_caps.h>  // For PSRAM
@@ -679,151 +681,23 @@
     }
   }
 // =====================================================================
-// REAL-TIME CLOCK UI
+// REAL-TIME CLOCK UI (LVGL)
 // =====================================================================
 
-struct ClockColor {
-    uint8_t r, g, b; // 5-6-5 components for blending
-    uint16_t val;    // Full RGB565 value
-};
-
-static const ClockColor clockPalette[] = {
-    {0, 63, 31,  0x07FF}, // Cyan
-    {31, 0, 31,  0xF81F}, // Magenta
-    {31, 63, 0,  0xFFE0}, // Yellow
-    {0, 63, 0,   0x07E0}, // Green
-    {31, 31, 0,  0xFD20}, // Orange
-    {31, 0, 15,  0xF810}, // Pink
-    {31, 63, 31, 0xFFFF}  // White
-};
-static int currentPaletteIndex = 0;
-
-// Ease Out Cubic function for smooth snapping
-float easeOutCubic(float t) {
-    return 1.0f - pow(1.0f - t, 3.0f);
-}
-
-// Helper to draw a filled heart with custom graphics (since fonts lack them)
-void drawAAFilledHeart(int x, int y, int size, uint16_t color) {
-    // A simple beautiful heart shape using primitive shapes
-    int r = size / 4;
-    display.fillCircle(x - r, y - r, r, color);
-    display.fillCircle(x + r, y - r, r, color);
-    display.fillTriangle(x - 2 * r, y - r/2, x + 2 * r, y - r/2, x, y + 2 * r, color);
-}
-
-// Shared buffer to avoid frequent malloc/free causing flicker
-static uint16_t aaLineBuf[240];
-
-void drawAARingSegment(int x1, int x2, int y, float r_in, float r_out, float targetAngle, uint8_t tr, uint8_t tg, uint8_t tb, uint16_t tval) {
-    if (x1 < 0) x1 = 0; if (x2 > 239) x2 = 239;
-    int w = x2 - x1 + 1;
-    if (w <= 0) return;
-    
-    float dy = y - 120.0f;
-    for (int i = 0; i < w; i++) {
-        float dx = (x1 + i) - 120.0f;
-        float distSq = dx*dx + dy*dy;
-        float dist = sqrt(distSq);
-        
-        float alphaDist = 1.0f;
-        if (dist < r_in) alphaDist = dist - (r_in - 1.0f);
-        else if (dist > r_out) alphaDist = (r_out + 1.0f) - dist;
-        if (alphaDist < 0.0f) alphaDist = 0.0f;
-        if (alphaDist > 1.0f) alphaDist = 1.0f;
-        
-        if (targetAngle < 360.0f) {
-            float angleRad = atan2(dy, dx);
-            float angleDeg = angleRad * 180.0f / PI + 90.0f;
-            if (angleDeg < 0.0f) angleDeg += 360.0f;
-            
-            float alphaAng = 1.0f;
-            if (targetAngle <= 0.0f) alphaAng = 0.0f;
-            else if (angleDeg > targetAngle) {
-                alphaAng = 1.0f - (angleDeg - targetAngle);
-                if (alphaAng < 0.0f) alphaAng = 0.0f;
-            }
-            if (angleDeg > 359.0f) {
-                float dStart = 360.0f - angleDeg; 
-                if (dStart < 1.0f && dStart < alphaAng) alphaAng = dStart;
-            }
-            alphaDist *= alphaAng;
-        }
-
-        if (alphaDist <= 0.0f) {
-            aaLineBuf[i] = GC9A01A_BLACK;
-        } else if (alphaDist >= 1.0f) {
-            aaLineBuf[i] = tval;
-        } else {
-            uint16_t r = (uint16_t)(tr * alphaDist);
-            uint16_t g = (uint16_t)(tg * alphaDist);
-            uint16_t b = (uint16_t)(tb * alphaDist);
-            aaLineBuf[i] = (r << 11) | (g << 5) | b;
-        }
-    }
-    display.drawRGBBitmap(x1, y, aaLineBuf, w, 1);
-}
-
-void drawAAFullRing(float r_in, float r_out, uint8_t r, uint8_t g, uint8_t b, uint16_t val) {
-    for (int y = 0; y < 240; y++) {
-        float dy = y - 120.0f;
-        float out_sq = (r_out+1.0f)*(r_out+1.0f) - dy*dy;
-        if (out_sq < 0.0f) continue;
-        float dx_out = sqrt(out_sq);
-        
-        float in_sq = (r_in-1.0f)*(r_in-1.0f) - dy*dy;
-        if (in_sq > 0.0f) {
-            float dx_in = sqrt(in_sq);
-            int x1 = 120 - (int)ceil(dx_out);
-            int x2 = 120 - (int)floor(dx_in);
-            drawAARingSegment(x1, x2, y, r_in, r_out, 360.0f, r, g, b, val);
-            
-            int x3 = 120 + (int)floor(dx_in);
-            int x4 = 120 + (int)ceil(dx_out);
-            drawAARingSegment(x3, x4, y, r_in, r_out, 360.0f, r, g, b, val);
-        } else {
-            int x_start = 120 - (int)ceil(dx_out);
-            int x_end = 120 + (int)ceil(dx_out);
-            drawAARingSegment(x_start, x_end, y, r_in, r_out, 360.0f, r, g, b, val);
-        }
-    }
-}
-
-// Draws only the arc segment from angleFrom to angleTo (no clear, incremental)
-void drawAARingArc(float angleFrom, float angleTo, float r_in, float r_out, const ClockColor& col) {
-    if (angleFrom >= angleTo) return;
-    for (int y = 0; y < 240; y++) {
-        float dy = y - 120.0f;
-        float out_sq = (r_out + 1.0f)*(r_out + 1.0f) - dy*dy;
-        if (out_sq < 0.0f) continue;
-        float dx_out = sqrtf(out_sq);
-        float in_sq  = (r_in  - 1.0f)*(r_in  - 1.0f) - dy*dy;
-        if (in_sq > 0.0f) {
-            float dx_in = sqrtf(in_sq);
-            drawAARingSegment(120-(int)ceilf(dx_out), 120-(int)floorf(dx_in), y, r_in, r_out, angleTo, col.r, col.g, col.b, col.val);
-            drawAARingSegment(120+(int)floorf(dx_in), 120+(int)ceilf(dx_out), y, r_in, r_out, angleTo, col.r, col.g, col.b, col.val);
-        } else {
-            drawAARingSegment(120-(int)ceilf(dx_out), 120+(int)ceilf(dx_out), y, r_in, r_out, angleTo, col.r, col.g, col.b, col.val);
-        }
-    }
+// LVGL Flush function
+void my_disp_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
+{
+    uint32_t w = lv_area_get_width(area);
+    uint32_t h = lv_area_get_height(area);
+    display.drawRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+    lv_display_flush_ready(disp);
 }
 
 void runRealtimeClock() {
     display.fillScreen(GC9A01A_BLACK);
-
-    // Ring geometry (borders)
-    const float R    = 118.5f;
-    const float W    = 5.0f;
-    const float r_in  = R - W/2.0f;  // 116.0
-    const float r_out = R + W/2.0f;  // 121.0
-
-    // Draw white inner ring ONCE — never cleared
-    drawAAFullRing(107.0f, 111.0f, 31, 63, 31, GC9A01A_WHITE);
-    // Clear the colored border ring area once on entry
-    drawAAFullRing(r_in - 1.0f, r_out + 1.0f, 0, 0, 0, GC9A01A_BLACK);
+    show_lvgl_clock();
 
     // --- BACKGROUND WIFI & NTP (only in clock mode) ---
-    // ntpEverSynced and lastNtpSyncMs are static so they persist across clock re-entries
     static bool ntpEverSynced = false;
     static uint32_t lastNtpSyncMs = 0;
     static uint32_t lastWifiBegin = 0;
@@ -850,34 +724,25 @@ void runRealtimeClock() {
         Serial.println("[Clock] NTP already synced recently, skipping WiFi.");
     }
 
-    int lastSec = -1;
-    bool lastHasTime = false;
-    char lastTStr[12] = "";
-    char lastDStr[32] = "";
-    bool footerDrawn = false;
     uint32_t lastNtpAttempt = 0;
+    uint32_t last_lv_tick = millis();
     
     while (true) {
         uint32_t now = millis();
-        if (readButtonHeld()) break;
+        if (readButtonHeld()) break; // Tahan tombol exit
 
         // --- BACKGROUND LOGIC ---
         struct tm t;
         bool hasTime = getLocalTime(&t, 0);
-        // Latch: once NTP is synced, never allow hasTime to go back to false
-        // (brief false returns from getLocalTime after WiFi off are spurious)
         if (!hasTime && ntpEverSynced) {
-            // Force a re-read with a small patience (2ms)
             hasTime = getLocalTime(&t, 2);
         }
         
         wl_status_t wfStatus = WiFi.status();
 
-        // Retry every 20s if WiFi is active but not connected yet
         static uint32_t lastRetry = 0;
         if (clockWifiActive && !hasTime && wfStatus != WL_CONNECTED && (now - lastWifiBegin > 20000) && (now - lastRetry > 20000)) {
             lastRetry = now;
-            Serial.println("[Clock] WiFi retry...");
             WiFi.disconnect();
             delay(200);
             esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -885,82 +750,28 @@ void runRealtimeClock() {
             lastWifiBegin = now;
         }
         
-        // If WiFi connects, trigger NTP request
         if (clockWifiActive && !hasTime && wfStatus == WL_CONNECTED && (now - lastNtpAttempt > 5000)) {
             lastNtpAttempt = now;
             configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
-            Serial.println("[Clock] WiFi Connected! Sending NTP request...");
         }
         
-        // Once synced: record timestamp, stop WiFi to save power
-        if (hasTime && !lastHasTime) {
+        if (hasTime && true) {
             ntpEverSynced = true;
             lastNtpSyncMs = millis();
             clockWifiActive = false;
             if (WiFi.getMode() != WIFI_OFF) {
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
-                Serial.println("[Clock] NTP synced! WiFi OFF. Will resync after 1 hour.");
             }
         }
 
-        int currentSec = hasTime ? t.tm_sec : -2; // -2 = NTP not ready, don't draw ring
-
-        // Only update if something changed
-        if (currentSec == lastSec && hasTime == lastHasTime) {
-            yield();
-            continue;
-        }
-        
-        // When time is first synced, reset the ring to start fresh from second 0
-        if (!lastHasTime && hasTime) {
-            lastSec = -1;
-            drawAAFullRing(r_in - 1.0f, r_out + 1.0f, 0, 0, 0, GC9A01A_BLACK);
-        }
-        lastHasTime = hasTime;
-
-        // Only draw the ring if NTP time is available
-        if (hasTime && currentSec >= 0) {
-            if (currentSec == 0 && lastSec > 0) {
-                // Minute changed: clear the entire ring and change color
-                currentPaletteIndex = (currentPaletteIndex + 1) % (sizeof(clockPalette)/sizeof(clockPalette[0]));
-                drawAAFullRing(r_in - 1.0f, r_out + 1.0f, 0, 0, 0, GC9A01A_BLACK);
-            } else {
-                // INCREMENTAL: draw arc from previous second to current second
-                float fromAngle = (lastSec < 0 ? 0 : lastSec) * 6.0f;
-                float toAngle   = currentSec * 6.0f;
-                if (lastSec < 0 || toAngle < fromAngle) {
-                    fromAngle = 0.0f;
-                }
-                const ClockColor& col = clockPalette[currentPaletteIndex];
-                drawAARingArc(fromAngle, toAngle, r_in, r_out, col);
-            }
-            lastSec = currentSec;
-        }
-
-        // --- DRAW TIME ---
-        char tStr[12];
-        if (hasTime) {
-            snprintf(tStr, sizeof(tStr), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-        } else {
-            snprintf(tStr, sizeof(tStr), "--:--:--");
-        }
-        if (strcmp(tStr, lastTStr) != 0) {
-            display.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
-            display.setTextSize(3);
-            int16_t tx1, ty1; uint16_t tw, th;
-            display.getTextBounds(tStr, 0, 0, &tx1, &ty1, &tw, &th);
-            display.setCursor((240 - tw) / 2, 85);
-            display.print(tStr);
-            strcpy(lastTStr, tStr);
-        }
-        
-        // --- DRAW DATE ---
-        const char * days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-        const char * months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+        // --- UPDATE LVGL OBJECTS ---
         char dStr[32];
         if (hasTime) {
+            const char * days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+            const char * months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
             snprintf(dStr, sizeof(dStr), "%s, %02d %s %04d", days[t.tm_wday], t.tm_mday, months[t.tm_mon], t.tm_year + 1900);
+            set_clock_time(t.tm_hour, t.tm_min, t.tm_sec, dStr);
         } else {
             if (wfStatus == WL_CONNECTED) {
                 snprintf(dStr, sizeof(dStr), "SYNCING TIME...");
@@ -971,42 +782,25 @@ void runRealtimeClock() {
             } else {
                 snprintf(dStr, sizeof(dStr), "CONNECTING WIFI...");
             }
-        }
-        if (strcmp(dStr, lastDStr) != 0) {
-            display.setTextColor(GC9A01A_CYAN, GC9A01A_BLACK);
-            display.setTextSize(1);
-            int16_t dx1, dy1; uint16_t dw, dh;
-            display.getTextBounds(dStr, 0, 0, &dx1, &dy1, &dw, &dh);
-            display.fillRect(30, 125, 180, 12, GC9A01A_BLACK);
-            display.setCursor((240 - dw) / 2, 125);
-            display.print(dStr);
-            strcpy(lastDStr, dStr);
+            // Dummy time while connecting
+            set_clock_time(10, 8, 38, dStr);
         }
 
-        // --- DRAW FOOTER (once total) ---
-        if (!footerDrawn) {
-            footerDrawn = true;
-            const char* name = "Alifia";
-            display.setTextColor(0xF81F, GC9A01A_BLACK);
-            display.setTextSize(1);
-            int16_t nx1, ny1; uint16_t nw, nh;
-            display.getTextBounds(name, 0, 0, &nx1, &ny1, &nw, &nh);
-            int heartSize = 8;
-            int totalW = nw + 6 + heartSize;
-            int startX = (240 - totalW) / 2;
-            display.setCursor(startX, 143);
-            display.print(name);
-            drawAAFilledHeart(startX + nw + 6 + heartSize/2, 147, heartSize, 0xF800);
-        }
+        lv_tick_inc(millis() - last_lv_tick);
+        last_lv_tick = millis();
+        lv_timer_handler();
 
         yield();
     }
-    // Clean up WiFi when exiting clock mode
+    
+    // Sembunyikan elemen jam sebelum keluar dari menu (agar UI tdk bocor ke GFX)
+    hide_lvgl_clock();
+
     if (WiFi.getMode() != WIFI_OFF) {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
     }
-    clockWifiActive = false; // Turn off WiFi activity flag on exit
+    clockWifiActive = false; 
     neopixelWrite(48, 0, 0, 0);
 }
 
@@ -1271,6 +1065,15 @@ void setup() {
     display.fillScreen(GC9A01A_BLACK);
 
     setContrast(CONTRAST_FULL);
+
+    // Initialize LVGL
+    lv_init();
+    lv_display_t * disp = lv_display_create(240, 240);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+    // Allocate 115KB di PSRAM
+    static uint8_t * lv_buf = (uint8_t *)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
+    lv_display_set_buffers(disp, lv_buf, NULL, 240 * 240 * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, my_disp_flush);
 
     listFolders();
     drawMenu();
