@@ -16,8 +16,7 @@ This project is an interactive, multi-functional smart display built around the 
 | Fix Spotify Remote Lyrics truncation | ✅ Done | Improved byte-handling and line wrap |
 | Fix Background RTC Clock Sync | ✅ Done | Wi-Fi disconnect no longer freezes UI |
 | Software Reboot RTC Wipe | ✅ Done | Fixed leftover broken state |
-| **Integrate SD Card Module** | ⏳ Pending | For expanding media storage on SPI bus |
-| **Add 2 Additional Physical Buttons** | ⏳ Pending | For easier menu navigation |
+| Integrate SD Card Module | ✅ Done | Done |
 | **Deep Sleep / Power Saving Mode** | ⏳ Pending | Maximize battery life (400mAh / 800mAh) |
 |**MQTT Function** | ⏳ Pending | For Sending message via MQTT |
 |**LVGL Ui Design** | ⏳ Pending | For better UI experience |

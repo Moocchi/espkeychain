@@ -2,7 +2,9 @@
   #include <Arduino.h>
   #include <SPI.h>
   #include <Wire.h>
-  #include <LittleFS.h>
+  #include <SD.h>
+  #include <FS.h>
+  #include <SdFat.h>
   #include <WiFi.h>
   #include <DNSServer.h>      // NEW: Captive portal DNS server
   #include <WebServer.h>      // NEW: WebServer for Web UI
@@ -30,6 +32,8 @@
   #define TFT_RST  D2
   #define TFT_MOSI D10
   #define TFT_SCLK D8
+  #define TFT_MISO D9
+  #define SD_CS    D7
 
   // The 240x240 main hardware display object
   Adafruit_GC9A01A display(TFT_CS, TFT_DC, TFT_RST);
@@ -70,8 +74,8 @@
   int menuState = 0; // 0=Main Menu, 1=Folder, 2=FPS, 3=WiFi
   int menuIndex = 0;
   
-  String mainMenuList[] = {"Jam Realtime", "Sytm Info", "Tampilkan Media", "Wifi Scan", "Up Media", "Spotify Remote", "Reset System"};
-  int mainMenuCount = 7;
+  String mainMenuList[] = {"Jam Realtime", "Sytm Info", "Tampilkan Media", "Wifi Scan", "Up Media", "Spotify Remote", "Format SD", "Reset System"};
+  int mainMenuCount = 8;
 
   String wifiList[20];
   int wifiCount = 0;
@@ -107,6 +111,7 @@
 
   // GIF FPS override yang dipilih user: 15, 30, atau 60
   int gifFps = 30; // default
+  String selectedMediaParam = ""; // Media yang dipilih user untuk diplay
 
   // Deteksi tombol tahan >= 500ms untuk exit GIF
   // Return true sekali saat threshold terpenuhi
@@ -180,13 +185,13 @@
   void listFolders() { // SCAN MEDIA: .bin file + BIN folder
     folderCount = 0;
     folderList[folderCount++] = "[ Back ]";
-    File root = LittleFS.open("/");
+    File root = SD.open("/");
     File file = root.openNextFile();
     while (file && folderCount < 20) {
       if (file.isDirectory()) {
          String dirName = String(file.name());
          bool hasMedia = false;
-         File subDir = LittleFS.open("/" + dirName);
+         File subDir = SD.open("/" + dirName);
          if (subDir) {
              File subFile = subDir.openNextFile();
              while (subFile) {
@@ -289,7 +294,7 @@
   void showBinFile(String filename) {
       String path = filename.startsWith("/") ? filename : "/" + filename;
 
-      File f = LittleFS.open(path, "r");
+      File f = SD.open(path, "r");
       if (!f) { Serial.println("MEDIA: not found: " + path); return; }
       
       size_t fSize = f.size();
@@ -306,13 +311,6 @@
       canvas.println(fmt);
       canvasDisplay();
       delay(800);
-
-      uint8_t header[4];
-      if (!isQoi) {
-          f.read(header, 4);
-          f.seek(0); // Reset file pointer
-          Serial.printf("MEDIA: First 4 bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", header[0], header[1], header[2], header[3]);
-      }
 
       uint16_t* imgBuf = (uint16_t*)ps_malloc(115200); // 240x240x2
       if (!imgBuf) { Serial.println("MEDIA: OOM!"); f.close(); return; }
@@ -393,7 +391,7 @@
           String seqExt = "";
           int frameCount = 0;
           int firstFrameIdx = -1;
-          File dir = LittleFS.open(fullPath);
+          File dir = SD.open(fullPath);
           if (dir) {
               File entry = dir.openNextFile();
               while (entry) {
@@ -422,7 +420,7 @@
                   sprintf(frameName, "/frame%04d", firstFrameIdx + i);
                   String framePath = fullPath + String(frameName) + seqExt;
                   
-                  File f = LittleFS.open(framePath, "r");
+                  File f = SD.open(framePath, "r");
                   if (!f) continue;
 
               size_t fSize = f.size();
@@ -442,13 +440,6 @@
                   canvas.setCursor(10, 45);
                   canvas.print("Fmt: "); canvas.println(fmt);
                   canvasDisplay();
-              }
-              
-              uint8_t header[4];
-              if (!isQoiSeq) {
-                  f.read(header, 4);
-                  f.seek(0); // Reset file pointer
-                  Serial.printf("PSRAM: Frame %d first 4 bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", i, header[0], header[1], header[2], header[3]);
               }
 
               psramFrames[i] = (uint16_t*)ps_malloc(115200);
@@ -495,10 +486,26 @@
               } else {
                   // If source is already 16-bit (115200 bytes), skip potential header
                   if (fSize > 115200) f.seek(fSize - 115200);
-                  f.read((uint8_t*)psramFrames[i], 115200);
-                  for(int p=0; p<57600; p++) {
-                      uint16_t c = psramFrames[i][p];
-                      psramFrames[i][p] = (c >> 8) | (c << 8);
+
+                  // Gunakan internal DMA buffer 8KB agar pembacaan dari SD Card via VFS jauh lebih cepat
+                  // daripada f.read() langsung ke pointer PSRAM (yang terpecah dan mematikan DMA direct).
+                  uint8_t* dmaBuf = (uint8_t*)malloc(8192);
+                  if (dmaBuf) {
+                      for(int offset = 0; offset < 115200; offset += 8192) {
+                          int chunk = (115200 - offset > 8192) ? 8192 : (115200 - offset);
+                          f.read(dmaBuf, chunk);
+                          memcpy((uint8_t*)psramFrames[i] + offset, dmaBuf, chunk);
+                      }
+                      free(dmaBuf);
+                  } else {
+                      f.read((uint8_t*)psramFrames[i], 115200);
+                  }
+
+                  // Super-fast 32-bit swap bytes
+                  uint32_t* p32 = (uint32_t*)psramFrames[i];
+                  for(int p=0; p<28800; p++) {
+                      uint32_t c = p32[p];
+                      p32[p] = ((c & 0x00FF00FF) << 8) | ((c & 0xFF00FF00) >> 8);
                   }
               }
               f.close();
@@ -634,9 +641,11 @@
     float usedPSRAM  = (ESP.getPsramSize() - ESP.getFreePsram()) / (1024.0 * 1024.0);
     int pctPSRAM = (ESP.getPsramSize() > 0) ? (int)((usedPSRAM / totalPSRAM) * 100) : 0;
 
-    float totalFS = LittleFS.totalBytes() / (1024.0 * 1024.0);
-    float usedFS = LittleFS.usedBytes() / (1024.0 * 1024.0);
-    int pctFS = (LittleFS.totalBytes() > 0) ? (int)((usedFS / totalFS) * 100) : 0;
+    uint64_t sdTotal = SD.totalBytes();
+    uint64_t sdUsed  = SD.usedBytes();
+    float totalFS = sdTotal / (1024.0 * 1024.0);
+    float usedFS = sdUsed / (1024.0 * 1024.0);
+    int pctFS = (sdTotal > 0) ? (int)((usedFS / totalFS) * 100) : 0;
 
     canvas.fillScreen(0);
     canvas.setTextSize(1);
@@ -649,7 +658,11 @@
     canvas.println(title);
 
     canvas.setCursor(0, 15);
-    canvas.printf("FS :%.1fM|%.1fM(%d%%)\n", totalFS, usedFS, pctFS);
+    if (sdTotal == 0 || SD.cardType() == CARD_NONE) {
+        canvas.println("SD : Not Detected");
+    } else {
+        canvas.printf("SD :%.1fM|%.1fM(%d%%)\n", totalFS, usedFS, pctFS);
+    }
     canvas.printf("RAM:%.2fM|%.2fM(%d%%)\n", totalRAM, usedRAM, pctRAM);
     
     if (totalPSRAM > 0) {
@@ -822,8 +835,8 @@ void runRealtimeClock() {
   }
 
   void handleStatus() {
-      float totalFS = LittleFS.totalBytes() / (1024.0 * 1024.0);
-      float usedFS = LittleFS.usedBytes() / (1024.0 * 1024.0);
+      float totalFS = SD.totalBytes() / (1024.0 * 1024.0);
+      float usedFS = SD.usedBytes() / (1024.0 * 1024.0);
       float freeFS = totalFS - usedFS;
       float totalRAM = ESP.getHeapSize() / 1024.0;
       float freeRAM = ESP.getFreeHeap() / 1024.0;
@@ -843,7 +856,7 @@ void runRealtimeClock() {
 
   void handleList() {
       String json = "{\"files\":[";
-      File root = LittleFS.open("/");
+      File root = SD.open("/");
       File file = root.openNextFile();
       bool first = true;
       while (file) {
@@ -859,11 +872,11 @@ void runRealtimeClock() {
   }
 
   void recursiveDelete(String path) {
-      File dir = LittleFS.open(path);
+      File dir = SD.open(path);
       if (!dir) return;
       if (!dir.isDirectory()) {
           dir.close();
-          LittleFS.remove(path);
+          SD.remove(path);
           return;
       }
       
@@ -880,15 +893,82 @@ void runRealtimeClock() {
           if (isDir) {
               recursiveDelete(childPath);
           } else {
-              LittleFS.remove(childPath);
+              SD.remove(childPath);
           }
           
-          dir = LittleFS.open(path); 
+          dir = SD.open(path); 
           if (!dir) break;
           file = dir.openNextFile(); 
       }
       dir.close();
-      LittleFS.rmdir(path);
+      SD.rmdir(path);
+  }
+
+  // Returns true if format succeeded
+  bool performRealFormat() {
+    Serial.println("[SD] Starting Real Format (FAT32)...");
+    SD.end(); // Tutup koneksi SD.h
+    delay(500);
+
+    // Re-initialize SPI bus for SD Card since SD.end() might mess it up
+    SPI.end();
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+    delay(100);
+
+    // Gunakan SdFs (support FAT + exFAT) agar SDXC 64GB+ bisa diinisialisasi
+    SdFs sd_fat;
+    if (!sd_fat.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(16), &SPI))) {
+      Serial.println("[SD] SdFat: Hardware init FAILED!");
+      return false;
+    }
+
+    // Gunakan FatFormatter untuk MEMAKSA format FAT32 pada kartu ukuran apapun
+    // (termasuk SDXC 64GB/128GB yang biasanya exFAT)
+    FatFormatter fatFormatter;
+    uint8_t secBuf[512];
+    Serial.println("[SD] Formatting to FAT32 (forced)...");
+    if (!fatFormatter.format(sd_fat.card(), secBuf, &Serial)) {
+      Serial.println("[SD] SD Format FAILED!");
+      return false;
+    }
+    
+    Serial.println("[SD] SD Format SUCCESS!");
+    sd_fat.end(); // Tutup SdFat
+    delay(500);
+
+    // Reset SD card state: toggle CS & re-init SPI bus
+    digitalWrite(SD_CS, HIGH);
+    SPI.end();
+    delay(500);
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+    delay(500);
+
+    // Coba remount dengan SD.h langsung (retry 5x)
+    bool mounted = false;
+    for (int i = 1; i <= 5; i++) {
+      Serial.printf("[SD] Remount attempt %d/5...\n", i);
+      if (SD.begin(SD_CS, SPI, 40000000)) {
+        mounted = true;
+        break;
+      }
+      SD.end();
+      delay(1000);
+      SPI.end();
+      SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+      delay(300);
+    }
+
+    if (mounted) {
+      uint8_t cardType = SD.cardType();
+      const char* typeStr = (cardType == CARD_MMC) ? "MMC" :
+                            (cardType == CARD_SD)  ? "SDSC" :
+                            (cardType == CARD_SDHC)? "SDHC" : "UNKNOWN";
+      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+      Serial.printf("[SD] Remounted OK! Type: %s | Size: %lluMB\n", typeStr, cardSize);
+    } else {
+      Serial.println("[SD] Remount failed. Tekan tombol RESET fisik untuk apply format.");
+    }
+    return true;
   }
 
   void handleDelete() {
@@ -899,8 +979,8 @@ void runRealtimeClock() {
       String path = server.arg("path");
       if (!path.startsWith("/")) path = "/" + path;
       
-      if (LittleFS.exists(path)) {
-          File f = LittleFS.open(path, "r");
+      if (SD.exists(path)) {
+          File f = SD.open(path, "r");
           bool isDir = false;
           if (f) {
               isDir = f.isDirectory();
@@ -911,7 +991,7 @@ void runRealtimeClock() {
               recursiveDelete(path);
               sendJsonResponse(200, "{\"status\":\"deleted\"}");
           } else {
-              if (LittleFS.remove(path)) {
+              if (SD.remove(path)) {
                   sendJsonResponse(200, "{\"status\":\"deleted\"}");
               } else {
                   sendJsonResponse(500, "{\"error\":\"delete failed\"}");
@@ -926,6 +1006,11 @@ void runRealtimeClock() {
       HTTPUpload& upload = server.upload();
       static File fsUploadFile;
       
+      // Fast Upload DMA Write Buffer
+      static uint8_t* writeBuffer = nullptr;
+      static size_t writeBufferLen = 0;
+      const size_t WRITE_BUFFER_MAX = 16384; // 16KB buffer
+      
       if (upload.status == UPLOAD_FILE_START) {
           String filename = upload.filename;
           if (!filename.startsWith("/")) filename = "/" + filename;
@@ -934,12 +1019,16 @@ void runRealtimeClock() {
           int lastSlash = filename.lastIndexOf('/');
           if (lastSlash > 0) {
               String dirPath = filename.substring(0, lastSlash);
-              if (!LittleFS.exists(dirPath)) {
-                  LittleFS.mkdir(dirPath);
+              if (!SD.exists(dirPath)) {
+                  SD.mkdir(dirPath);
               }
           }
 
-          fsUploadFile = LittleFS.open(filename, FILE_WRITE);
+          fsUploadFile = SD.open(filename, FILE_WRITE);
+          
+          if (!writeBuffer) writeBuffer = (uint8_t*)malloc(WRITE_BUFFER_MAX);
+          writeBufferLen = 0;
+
           Serial.print("Upload Start: "); Serial.println(filename);
 
           canvas.fillScreen(0);
@@ -951,10 +1040,36 @@ void runRealtimeClock() {
           canvas.println(shortName);
           canvasDisplay();
       } else if (upload.status == UPLOAD_FILE_WRITE) {
-          if (fsUploadFile) fsUploadFile.write(upload.buf, upload.currentSize);
+          if (fsUploadFile && writeBuffer) {
+              size_t offset = 0;
+              while (offset < upload.currentSize) {
+                  size_t copyLen = upload.currentSize - offset;
+                  if (writeBufferLen + copyLen > WRITE_BUFFER_MAX) {
+                      copyLen = WRITE_BUFFER_MAX - writeBufferLen;
+                  }
+                  memcpy(writeBuffer + writeBufferLen, upload.buf + offset, copyLen);
+                  writeBufferLen += copyLen;
+                  offset += copyLen;
+                  
+                  if (writeBufferLen == WRITE_BUFFER_MAX) {
+                      fsUploadFile.write(writeBuffer, WRITE_BUFFER_MAX);
+                      writeBufferLen = 0;
+                  }
+              }
+          } else if (fsUploadFile) {
+              fsUploadFile.write(upload.buf, upload.currentSize);
+          }
       } else if (upload.status == UPLOAD_FILE_END) {
           if (fsUploadFile) {
+              if (writeBuffer && writeBufferLen > 0) {
+                  fsUploadFile.write(writeBuffer, writeBufferLen);
+                  writeBufferLen = 0;
+              }
               fsUploadFile.close();
+              if (writeBuffer) {
+                  free(writeBuffer);
+                  writeBuffer = nullptr;
+              }
               Serial.print("Upload Size: "); Serial.println(upload.totalSize);
           }
           
@@ -1050,16 +1165,18 @@ void setup() {
     // NeoPixel dimatikan saat boot
     neopixelWrite(48, 0, 0, 0);
 
-    // Initialize LittleFS
-    if(!LittleFS.begin(true)){
-        Serial.println("LittleFS Mount Failed");
-    }
+    // Initialize SD Card (shared SPI bus with TFT display)
+    // Both CS pins HIGH before SPI init to prevent bus conflict
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    pinMode(TFT_CS, OUTPUT);
+    digitalWrite(TFT_CS, HIGH);
 
     // WiFi hanya konek saat diperlukan (Clock mode) - tidak konek saat boot
     WiFi.mode(WIFI_OFF);
 
-    SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
-    display.begin(80000000); // 40MHz for Display
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI); 
+    display.begin(80000000); // 80MHz for Display
     setCpuFrequencyMhz(160); // Boost to 160MHz for better stability
     display.setRotation(0);
     display.fillScreen(GC9A01A_BLACK);
@@ -1074,6 +1191,49 @@ void setup() {
     static uint8_t * lv_buf = (uint8_t *)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
     lv_display_set_buffers(disp, lv_buf, NULL, 240 * 240 * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, my_disp_flush);
+
+    // Re-init SPI bus AFTER display.begin() to restore MISO pin config
+    // display.begin() may override SPI settings and drop MISO
+    SPI.end();
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+
+    // Mount SD Card - explicit SPI bus & safe frequency for initial handshake
+    Serial.println("[SD] Attempting SD card init...");
+    Serial.printf("[SD] Pins: CS=%d, SCK=%d, MISO=%d, MOSI=%d\n", SD_CS, TFT_SCLK, TFT_MISO, TFT_MOSI);
+    
+    bool sdMounted = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.printf("[SD] Mount attempt %d/3...\n", attempt);
+        if (SD.begin(SD_CS, SPI, 40000000)) {
+            sdMounted = true;
+            break;
+        }
+        Serial.println("[SD] Mount failed, retrying...");
+        SD.end();
+        delay(1000); // Tunggu SD card stabilize
+        SPI.end();
+        SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+        delay(200);
+    }
+    
+    if (!sdMounted) {
+        Serial.println("[SD] Mount FAILED after 3 attempts! Check: wiring, card format (FAT32), card inserted?");
+        canvas.fillScreen(0);
+        canvas.setCursor(10, 20);
+        canvas.println("SD CARD ERROR!");
+        canvas.setCursor(10, 35);
+        canvas.println("Check wiring/card");
+        canvasDisplay();
+        delay(3000);
+    } else {
+        uint8_t cardType = SD.cardType();
+        const char* typeStr = (cardType == CARD_MMC) ? "MMC" :
+                              (cardType == CARD_SD)  ? "SDSC" :
+                              (cardType == CARD_SDHC)? "SDHC" : "UNKNOWN";
+        uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+        Serial.printf("[SD] Card Type: %s | Size: %lluMB\n", typeStr, cardSize);
+        Serial.printf("[SD] Total: %lluMB | Used: %lluMB\n", SD.totalBytes()/(1024*1024), SD.usedBytes()/(1024*1024));
+    }
 
     listFolders();
     drawMenu();
@@ -1129,9 +1289,10 @@ void setup() {
           showSystemInfo(true);
           drawMenu();
         } else if (menuIndex == 2) {
-          // Play GIF -> Masuk menu FPS dulu, lalu folder
-          menuState = 2;
-          menuIndex = 1; // default ke 30fps (index 1)
+          // Play Media -> Masuk menu Folder List dulu sebelum pilih FPS
+          listFolders();
+          menuState = 1;
+          menuIndex = 0;
           drawMenu();
         } else if (menuIndex == 3) {
           // Scan WiFi (set STA mode dulu, lalu bersihkan cache lama)
@@ -1181,6 +1342,66 @@ void setup() {
           menuIndex = 0;
           drawMenu();
         } else if (menuIndex == 6) {
+          // Format SD Card
+          canvas.fillScreen(0);
+          canvas.setTextSize(1);
+          canvas.setTextColor(1);
+          canvas.setCursor(0, 5);
+          canvas.println("FORMAT SD CARD?");
+          canvas.setCursor(0, 20);
+          canvas.println("ALL DATA WILL BE");
+          canvas.setCursor(0, 30);
+          canvas.println("DELETED!");
+          canvas.setCursor(0, 45);
+          canvas.println("2xKlik=YA 1x=BATAL");
+          canvasDisplay();
+          
+          // Tunggu konfirmasi
+          delay(300);
+          bool doFormat = false;
+          while (true) {
+              int confirmBtn = readButtonState();
+              if (confirmBtn == 2) { doFormat = true; break; }
+              if (confirmBtn == 1) { break; } // batal
+              yield();
+          }
+          
+          if (doFormat) {
+              canvas.fillScreen(0);
+              canvas.setCursor(10, 20);
+              canvas.println("FORMATTING...");
+              canvas.setCursor(10, 35);
+              canvas.println("Please wait");
+              canvasDisplay();
+              
+              // Melakukan "Real Format" menggunakan SdFat
+              bool ok = performRealFormat();
+              
+              canvas.fillScreen(0);
+              if (ok) {
+                canvas.setCursor(10, 15);
+                canvas.println("FORMAT DONE!");
+                if (SD.cardType() != CARD_NONE) {
+                  canvas.setCursor(10, 30);
+                  canvas.println("SD Card OK!");
+                } else {
+                  canvas.setCursor(10, 30);
+                  canvas.println("Tekan RESET");
+                  canvas.setCursor(10, 40);
+                  canvas.println("untuk apply.");
+                }
+              } else {
+                canvas.setCursor(10, 28);
+                canvas.println("FORMAT FAILED!");
+              }
+              canvasDisplay();
+              delay(3000);
+          }
+          
+          menuState = 0;
+          menuIndex = 0;
+          drawMenu();
+        } else if (menuIndex == 7) {
           // Reset System
           canvas.fillScreen(0);
           canvas.setTextSize(1);
@@ -1205,7 +1426,18 @@ void setup() {
         int fpsList[] = {15, 30, 60};
         gifFps = fpsList[menuIndex];
         Serial.printf("FPS dipilih: %d\n", gifFps);
-        // Lanjut ke folder GIF
+        
+        // --- Eksekusi Play Media yang dipilih ---
+        String selection = selectedMediaParam;
+        String selLow = selection; selLow.toLowerCase();
+
+        if (selection.endsWith("/")) {
+            playBinFrames(selection);
+        } else {
+            showBinFile(selection);
+        }
+
+        // Kembali ke list folder setelah putar media selesai / di-_cancel_
         listFolders();
         menuState = 1;
         menuIndex = 0;
@@ -1216,16 +1448,10 @@ void setup() {
           menuIndex = 0;
           drawMenu();
         } else if (folderList[menuIndex] != "(No .bin Media)") {
-            String selection = folderList[menuIndex];
-            String selLow = selection; selLow.toLowerCase();
-
-            if (selection.endsWith("/")) {
-                playBinFrames(selection);
-            } else {
-                showBinFile(selection);
-            }
-
-            menuState = 1;
+            // Simpan media yang disorot, lalu tanyakan FPS
+            selectedMediaParam = folderList[menuIndex];
+            menuState = 2; // Menu FPS
+            menuIndex = 1; // Default ke 30 FPS
             drawMenu();
         } else {
             // It is "(No .bin Media)" - Return to main menu
