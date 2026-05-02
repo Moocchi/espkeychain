@@ -1,1884 +1,15 @@
-  #include <Update.h>
-  #include <Arduino.h>
-  #include <SPI.h>
-  #include <Wire.h>
-  #include <SD.h>
-  #include <FS.h>
-  #include <SdFat.h>
-  #include <WiFi.h>
-  #include <DNSServer.h>      // NEW: Captive portal DNS server
-  #include <WebServer.h>      // NEW: WebServer for Web UI
-  #include <Adafruit_GFX.h>
-  #include <Adafruit_GC9A01A.h>
-  #include <lvgl.h>
-  #include "ui/lvgl_clock.h"
-  #include <Fonts/FreeSansBold12pt7b.h>
-  #include "ntp_time.h"
-  #include <esp_heap_caps.h>  // For PSRAM
-  #include <esp_wifi.h>       // For low-level WiFi control (WPA2 force)
-  #include <ESPmDNS.h>
-  #include "SpotifyRemote.h"
-    #include <AnimatedGIF.h>
-
-  // Define ps_malloc as heap_caps_malloc for SPIRAM
-  #define ps_malloc(size) heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-  
-  #define QOI_MALLOC(sz) ps_malloc(sz)
-  #define QOI_FREE(p)    free(p)
-  #define QOI_IMPLEMENTATION
-  #include "qoi.h"
-
-  #define TFT_CS   D0
-  #define TFT_DC   D1
-  #define TFT_RST  D2
-  #define TFT_MOSI D10
-  #define TFT_SCLK D8
-  #define TFT_MISO D9
-  #define SD_CS    D7
-
-  // The 240x240 main hardware display object
-  Adafruit_GC9A01A display(TFT_CS, TFT_DC, TFT_RST);
-
-  // GFX compatibility layer: A 128x64 virtual memory display that behaves precisely like the old SSD1306
-  #define SCREEN_WIDTH 128
-  #define SCREEN_HEIGHT 64
-  GFXcanvas1 canvas(SCREEN_WIDTH, SCREEN_HEIGHT);
-  
-  // A static buffer to drastically speed up 1-bit to 16-bit conversions (16KB RAM)
-  static uint16_t canvasColors[SCREEN_WIDTH * SCREEN_HEIGHT];
-
-  // Custom function to push the 128x64 canvas content centered onto the 240x240 screen extremely fast
-  void canvasDisplay() {
-      uint8_t *buffer = canvas.getBuffer();
-      int idx = 0;
-      for (int y = 0; y < SCREEN_HEIGHT; y++) {
-          for (int x = 0; x < SCREEN_WIDTH; x++) {
-              bool pixel = buffer[y * (SCREEN_WIDTH / 8) + (x / 8)] & (0x80 >> (x & 7));
-              canvasColors[idx++] = pixel ? GC9A01A_WHITE : GC9A01A_BLACK;
-          }
-      }
-      display.drawRGBBitmap((240 - SCREEN_WIDTH) / 2, (240 - SCREEN_HEIGHT) / 2, canvasColors, SCREEN_WIDTH, SCREEN_HEIGHT);
-  }
-
-  // --- WEB Setup ---
-  WebServer server(80);
-  DNSServer dnsServer;
-  bool isWebUploadMode = false;
-
-  // Touch Sensor pin (XIAO ESP32S3 - D3 pin)
-  #define TOUCH_PIN D3
-  #define TOUCH_ACTIVE_STATE HIGH // Ganti ke LOW jika sensor aktif saat disentuh ke gnd
-
-  String folderList[20];
-  int folderCount = 0;
-
-    int menuState = 0; // 0=Main Menu, 1=Folder, 2=FPS Bin Anim, 3=WiFi
-  int menuIndex = 0;
-  
-  String mainMenuList[] = {"Jam Realtime", "Sytm Info", "Tampilkan Media", "Wifi Scan", "Up Media", "Spotify Remote", "Format SD", "Reset System"};
-  int mainMenuCount = 8;
-
-  String wifiList[20];
-  int wifiCount = 0;
-
-  int fpsMenuIndex = 0;
-  const uint8_t  CONTRAST_FULL  = 255;
-
-  // --- PSRAM BINARY CACHING ---
-  #define MAX_PSRAM_FRAMES 100
-  uint16_t* psramFrames[MAX_PSRAM_FRAMES];
-  int totalLoadedFrames = 0;
-  String currentlyLoadedFolder = "";
-
-    // --- GIF PLAYBACK (SD -> AnimatedGIF -> TFT) ---
-    AnimatedGIF gifPlayer;
-    File gifFile;
-    uint16_t gifLineBuffer[240];
-    int gifDrawOffsetX = 0;
-    int gifDrawOffsetY = 0;
-    uint8_t* gifDataPSRAM = NULL;
-    size_t gifDataPSRAMSize = 0;
-    uint16_t* gifFrameCanvas = NULL; // 240x240 RGB565 canvas untuk update per-frame agar minim tearing
-    bool gifUseCanvasCompose = false;
-    uint8_t* gifCookedFrameBuffer = NULL; // [indexed canvas][cooked RGB565 canvas]
-    size_t gifCookedFrameBufferSize = 0;
-    bool gifUseCookedFrameOutput = false;
-    bool gifComposeDirty = false;
-    int gifDirtyMinX = 0;
-    int gifDirtyMinY = 0;
-    int gifDirtyMaxX = -1;
-    int gifDirtyMaxY = -1;
-
-  void clearPSRAMCache() {
-      for (int i = 0; i < MAX_PSRAM_FRAMES; i++) {
-          if (psramFrames[i] != NULL) {
-              free(psramFrames[i]);
-              psramFrames[i] = NULL;
-          }
-      }
-      totalLoadedFrames = 0;
-      currentlyLoadedFolder = "";
-      Serial.println("PSRAM: Cache Cleared");
-  }
-
-  // Variabel untuk deteksi Double-Click
-  uint32_t lastClickTime = 0;
-  bool buttonState = !TOUCH_ACTIVE_STATE;
-  bool lastButtonState = !TOUCH_ACTIVE_STATE;
-  const uint32_t DOUBLE_CLICK_GAP = 250; // Maksimal 250ms antar klik
-  const uint32_t DEBOUNCE_DELAY = 50;
-  uint32_t lastDebounceTime = 0;
-
-    // FPS untuk animasi folder frameXXXX.bin/qoi
-  int gifFps = 30; // default
-
-    // FPS override GIF: 0 = delay asli GIF, >0 = paksa FPS
-    int gifFpsOverride = 0;
-    bool selectedMediaIsGif = false;
-  String selectedMediaParam = ""; // Media yang dipilih user untuk diplay
-
-    // Deteksi tombol tahan >= 500ms untuk exit media
-  // Return true sekali saat threshold terpenuhi
-  uint32_t btnHoldStart = 0;
-  bool btnHoldFired = false;
-  bool readButtonHeld() {
-      bool pressed = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE_STATE);
-      if (pressed) {
-          if (btnHoldStart == 0) {
-              btnHoldStart = millis();
-              btnHoldFired = false;
-          } else if (!btnHoldFired && (millis() - btnHoldStart >= 500)) {
-              btnHoldFired = true;
-              btnHoldStart = 0;
-              return true;
-          }
-      } else {
-          btnHoldStart = 0;
-          btnHoldFired = false;
-      }
-      return false;
-  }
-
-  // Fungsi membaca klik (0 = Ga ngapa-ngapain, 1 = Single Click (NEXT), 2 = Double Click (ENTER))
-  int readButtonState() {
-      int action = 0;
-      bool reading = digitalRead(TOUCH_PIN);
-      uint32_t now = millis();
-
-      // Debounce: kalau terjadi perubahan state fisik
-      if (reading != lastButtonState) {
-          lastDebounceTime = now;
-      }
-
-      // Validasi state tombol setelah melewati masa debounce
-      if ((now - lastDebounceTime) > DEBOUNCE_DELAY) {
-          if (reading != buttonState) {
-              buttonState = reading;
-              
-              // Jika tombol baru saja DITEKAN
-              if (buttonState == TOUCH_ACTIVE_STATE) {
-                  if (now - lastClickTime < DOUBLE_CLICK_GAP) {
-                      // Jarak waktu dengan klik sebelumnya masih masuk: DOUBLE CLICK!
-                      action = 2;
-                      lastClickTime = 0; // reset
-                  } else {
-                      // Ini baru klik pertama
-                      lastClickTime = now;
-                  }
-              }
-          }
-      }
-
-      // Cek kalau waktu gap habis dan gak ada klik kedua -> SINGLE CLICK!
-      if (lastClickTime > 0 && (now - lastClickTime) > DOUBLE_CLICK_GAP) {
-          // Hanya daftar jika saat ini tombol sudah dilepas atau sengaja ditahan
-          if (buttonState != TOUCH_ACTIVE_STATE) {
-              action = 1;
-              lastClickTime = 0;
-          }
-      }
-
-      lastButtonState = reading;
-      return action;
-  }
-
-  void setContrast(uint8_t level) {
-    // GC9A01A does not support simple contrast via software. Do nothing.
-  }
-
-    void listFolders() { // SCAN MEDIA: file .bin/.qoi/.gif + folder frameXXXX(.bin/.qoi)
-    folderCount = 0;
-    folderList[folderCount++] = "[ Back ]";
-    File root = SD.open("/");
-    File file = root.openNextFile();
-    while (file && folderCount < 20) {
-      if (file.isDirectory()) {
-         String dirName = String(file.name());
-         bool hasMedia = false;
-         File subDir = SD.open("/" + dirName);
-         if (subDir) {
-             File subFile = subDir.openNextFile();
-             while (subFile) {
-                 String sfname = String(subFile.name());
-                 sfname.toLowerCase();
-                 if (sfname.startsWith("frame") && (sfname.endsWith(".bin") || sfname.endsWith(".qoi"))) {
-                     hasMedia = true; break;
-                 }
-                 subFile = subDir.openNextFile();
-             }
-             subDir.close();
-         }
-         if (hasMedia) {
-             folderList[folderCount++] = dirName + "/";
-         }
-      } else {
-         String fname = String(file.name());
-         String fl = fname; fl.toLowerCase();
-         if (fl.endsWith(".bin") || fl.endsWith(".qoi") || fl.endsWith(".gif")) {
-             folderList[folderCount++] = fname;
-         }
-      }
-      file = root.openNextFile();
-    }
-    root.close();
-    if (folderCount == 1) {
-      folderList[1] = "(No Media)";
-      folderCount = 2;
-    }
-  }
-
-  bool decodeQOI(File& f, uint16_t* outBuf) {
-      // Clear outBuf immediately to black. If decode fails or dimensions are smaller, background stays black instead of TV static memory garbage.
-      memset(outBuf, 0, 115200);
-
-      size_t fSize = f.size();
-      if (fSize == 0) return false;
-
-      // Allocate temporary buffer for compressed QOI data in PSRAM
-      void* qoiData = ps_malloc(fSize);
-      if (!qoiData) {
-          Serial.println("QOI: Failed to allocate memory for compressed data.");
-          return false;
-      }
-
-      f.read((uint8_t*)qoiData, fSize);
-
-      qoi_desc desc;
-      // This will now use ps_malloc via our macro, safely allocating 230KB in PSRAM
-      void* decodedPixels = qoi_decode(qoiData, fSize, &desc, 4); // Force RGBA (4 channels)
-      free(qoiData);
-
-      if (!decodedPixels) {
-          Serial.println("QOI: qoi_decode failed to allocate uncompressed RGBA buffer.");
-          return false;
-      }
-
-      // Convert from 32-bit RGBA to 16-bit RGB565 with byte-swapping for Adafruit SPI
-      // Handle any QOI dimensions — center on 240x240 display, crop if larger
-      uint8_t* rgba = (uint8_t*)decodedPixels;
-      uint32_t srcW = desc.width;
-      uint32_t srcH = desc.height;
-      const uint32_t dstW = 240;
-      const uint32_t dstH = 240;
-
-      // Source offset (center-crop if source > display)
-      uint32_t srcOffX = (srcW > dstW) ? (srcW - dstW) / 2 : 0;
-      uint32_t srcOffY = (srcH > dstH) ? (srcH - dstH) / 2 : 0;
-      // Destination offset (center if source < display)
-      uint32_t dstOffX = (srcW < dstW) ? (dstW - srcW) / 2 : 0;
-      uint32_t dstOffY = (srcH < dstH) ? (dstH - srcH) / 2 : 0;
-      // Copy region
-      uint32_t copyW = (srcW < dstW) ? srcW : dstW;
-      uint32_t copyH = (srcH < dstH) ? srcH : dstH;
-
-      for (uint32_t y = 0; y < copyH; y++) {
-          for (uint32_t x = 0; x < copyW; x++) {
-              uint32_t srcIdx = ((y + srcOffY) * srcW + (x + srcOffX)) * 4;
-              uint32_t dstIdx = (y + dstOffY) * dstW + (x + dstOffX);
-              uint8_t r = rgba[srcIdx + 0];
-              uint8_t g = rgba[srcIdx + 1];
-              uint8_t b = rgba[srcIdx + 2];
-              uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-              outBuf[dstIdx] = color;
-          }
-      }
-
-      free(decodedPixels);
-      return true;
-  }
-
-  String getBinFormatName(size_t fSize) {
-      if (fSize >= 230400) return "RGBA 32-bit";
-      if (fSize >= 172800) return "RGB 24-bit";
-      if (fSize >= 115200) return "RGB565 16-bit";
-      if (fSize >= 7200)   return "1-bit Mono";
-      return "Unknown Format";
-  }
-
-  void showBinFile(String filename) {
-      String path = filename.startsWith("/") ? filename : "/" + filename;
-
-      File f = SD.open(path, "r");
-      if (!f) { Serial.println("MEDIA: not found: " + path); return; }
-      
-      size_t fSize = f.size();
-      bool isQoi = path.endsWith(".qoi") || path.endsWith(".QOI");
-      Serial.printf("MEDIA: File size: %d bytes\n", fSize);
-      String fmt = isQoi ? "QOI Image" : getBinFormatName(fSize);
-      Serial.println("MEDIA: Detected Format: " + fmt);
-
-      // Show format on OLED briefy
-      canvas.fillScreen(0);
-      canvas.setCursor(10, 20);
-      canvas.println("Playing MEDIA:");
-      canvas.setCursor(10, 35);
-      canvas.println(fmt);
-      canvasDisplay();
-      delay(800);
-
-      uint16_t* imgBuf = (uint16_t*)ps_malloc(115200); // 240x240x2
-      if (!imgBuf) { Serial.println("MEDIA: OOM!"); f.close(); return; }
-
-      if (isQoi) {
-          decodeQOI(f, imgBuf);
-      } else if (fSize >= 230400) { // 32-bit RGBA
-          if (fSize > 230400) f.seek(fSize - 230400); // Skip header
-          uint8_t r_buf[240*4];
-          for (int y = 0; y < 240; y++) {
-              f.read(r_buf, 240*4);
-              for (int x = 0; x < 240; x++) {
-                  uint8_t r = r_buf[x*4+0], g = r_buf[x*4+1], b = r_buf[x*4+2];
-                  uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                  imgBuf[y*240+x] = color; 
-              }
-          }
-      } else if (fSize >= 172800) { // 24-bit RGB
-          if (fSize > 172800) f.seek(fSize - 172800); // Skip header
-          uint8_t r_buf[240*3];
-          for (int y = 0; y < 240; y++) {
-              f.read(r_buf, 240*3);
-              for (int x = 0; x < 240; x++) {
-                  uint8_t r = r_buf[x*3+0], g = r_buf[x*3+1], b = r_buf[x*3+2];
-                  uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                  imgBuf[y*240+x] = color; 
-              }
-          }
-      } else if (fSize >= 7200 && fSize < 10000) { 
-          // 1-bit Monochrome (240x240 / 8 = 7200 bytes)
-          if (fSize > 7200) f.seek(fSize - 7200);
-          uint8_t* bits = (uint8_t*)malloc(7200);
-          if (bits) {
-              f.read(bits, 7200);
-              for (int i = 0; i < 57600; i++) {
-                  int byteIdx = i / 8;
-                  int bitIdx = 7 - (i % 8); 
-                  bool pixel = (bits[byteIdx] >> bitIdx) & 0x01;
-                  imgBuf[i] = pixel ? 0xFFFF : 0x0000;
-              }
-              free(bits);
-          }
-      } else {
-          // If source is already 16-bit (115200 bytes), skip potential header
-          if (fSize > 115200) f.seek(fSize - 115200);
-          f.read((uint8_t*)imgBuf, 115200);
-          
-          for(int p=0; p<57600; p++) {
-              uint16_t c = imgBuf[p];
-              imgBuf[p] = (c >> 8) | (c << 8);
-          }
-      }
-      f.close();
-
-      display.drawRGBBitmap(0, 0, imgBuf, 240, 240);
-      free(imgBuf);
-
-      Serial.println("MEDIA: done. Tahan BOOT 500ms = kembali.");
-      btnHoldStart = 0; btnHoldFired = false;
-      while (true) { delay(10); if (readButtonHeld()) break; }
-      display.fillScreen(GC9A01A_BLACK);
-  }
-
-  void resetGifComposeDirtyRect() {
-      gifComposeDirty = false;
-      gifDirtyMinX = 240;
-      gifDirtyMinY = 240;
-      gifDirtyMaxX = -1;
-      gifDirtyMaxY = -1;
-  }
-
-  void markGifComposeDirtyRect(int x, int y, int w, int h) {
-      if (w <= 0 || h <= 0) {
-          return;
-      }
-
-      int x0 = x;
-      int y0 = y;
-      int x1 = x + w;
-      int y1 = y + h;
-
-      if (x0 < 0) x0 = 0;
-      if (y0 < 0) y0 = 0;
-      if (x1 > 240) x1 = 240;
-      if (y1 > 240) y1 = 240;
-
-      if (x1 <= x0 || y1 <= y0) {
-          return;
-      }
-
-      if (!gifComposeDirty) {
-          gifDirtyMinX = x0;
-          gifDirtyMinY = y0;
-          gifDirtyMaxX = x1 - 1;
-          gifDirtyMaxY = y1 - 1;
-          gifComposeDirty = true;
-          return;
-      }
-
-      if (x0 < gifDirtyMinX) gifDirtyMinX = x0;
-      if (y0 < gifDirtyMinY) gifDirtyMinY = y0;
-      if (x1 - 1 > gifDirtyMaxX) gifDirtyMaxX = x1 - 1;
-      if (y1 - 1 > gifDirtyMaxY) gifDirtyMaxY = y1 - 1;
-  }
-
-  void flushGifComposeDirtyRect() {
-      if (!gifUseCanvasCompose || !gifFrameCanvas || !gifComposeDirty) {
-          return;
-      }
-
-      int x = gifDirtyMinX;
-      int y = gifDirtyMinY;
-      int w = gifDirtyMaxX - gifDirtyMinX + 1;
-      int h = gifDirtyMaxY - gifDirtyMinY + 1;
-      if (w <= 0 || h <= 0) {
-          return;
-      }
-
-      display.startWrite();
-      display.setAddrWindow(x, y, w, h);
-      const uint16_t *src = gifFrameCanvas + (y * 240) + x;
-      for (int row = 0; row < h; row++) {
-          display.writePixels((uint16_t*)src, w, true, false);
-          src += 240;
-      }
-      display.endWrite();
-      resetGifComposeDirtyRect();
-  }
-
-  bool ensureGifCookedFrameBuffer(size_t requiredSize) {
-      if (requiredSize == 0) {
-          return false;
-      }
-
-      if (gifCookedFrameBuffer && gifCookedFrameBufferSize >= requiredSize) {
-          memset(gifCookedFrameBuffer, 0, requiredSize);
-          return true;
-      }
-
-      if (gifCookedFrameBuffer) {
-          free(gifCookedFrameBuffer);
-          gifCookedFrameBuffer = NULL;
-          gifCookedFrameBufferSize = 0;
-      }
-
-      gifCookedFrameBuffer = (uint8_t*)ps_malloc(requiredSize);
-      if (!gifCookedFrameBuffer) {
-          return false;
-      }
-
-      gifCookedFrameBufferSize = requiredSize;
-      memset(gifCookedFrameBuffer, 0, requiredSize);
-      return true;
-  }
-
-  void flushGifCookedFrameRect(int frameX, int frameY, int frameW, int frameH, int canvasW, int canvasH) {
-      if (!gifUseCookedFrameOutput || !gifCookedFrameBuffer) {
-          return;
-      }
-      if (frameW <= 0 || frameH <= 0 || canvasW <= 0 || canvasH <= 0) {
-          return;
-      }
-
-      int srcX0 = frameX;
-      int srcY0 = frameY;
-      int srcX1 = frameX + frameW;
-      int srcY1 = frameY + frameH;
-
-      if (srcX0 < 0) srcX0 = 0;
-      if (srcY0 < 0) srcY0 = 0;
-      if (srcX1 > canvasW) srcX1 = canvasW;
-      if (srcY1 > canvasH) srcY1 = canvasH;
-      if (srcX1 <= srcX0 || srcY1 <= srcY0) {
-          return;
-      }
-
-      int dstX = gifDrawOffsetX + srcX0;
-      int dstY = gifDrawOffsetY + srcY0;
-      int copyW = srcX1 - srcX0;
-      int copyH = srcY1 - srcY0;
-
-      if (dstX < 0) {
-          int skip = -dstX;
-          dstX = 0;
-          srcX0 += skip;
-          copyW -= skip;
-      }
-      if (dstY < 0) {
-          int skip = -dstY;
-          dstY = 0;
-          srcY0 += skip;
-          copyH -= skip;
-      }
-      if (dstX + copyW > 240) {
-          copyW = 240 - dstX;
-      }
-      if (dstY + copyH > 240) {
-          copyH = 240 - dstY;
-      }
-      if (copyW <= 0 || copyH <= 0) {
-          return;
-      }
-
-      uint16_t *cookedCanvas = (uint16_t *)(gifCookedFrameBuffer + ((size_t)canvasW * (size_t)canvasH));
-      uint16_t *src = cookedCanvas + ((size_t)srcY0 * (size_t)canvasW) + (size_t)srcX0;
-
-      display.startWrite();
-      display.setAddrWindow(dstX, dstY, copyW, copyH);
-      for (int row = 0; row < copyH; row++) {
-          display.writePixels(src, copyW, true, false);
-          src += canvasW;
-      }
-      display.endWrite();
-  }
-
-  void prepareGifComposeCanvas() {
-      if (!gifFrameCanvas) {
-          gifFrameCanvas = (uint16_t*)ps_malloc(115200); // 240x240x2
-      }
-      gifUseCanvasCompose = (gifFrameCanvas != NULL);
-      if (gifUseCanvasCompose) {
-          memset(gifFrameCanvas, 0, 115200);
-          resetGifComposeDirtyRect();
-          Serial.println("GIF: Canvas compose ON (reduced tearing).");
-      } else {
-          Serial.println("GIF: Canvas compose OFF (OOM), fallback per-line.");
-      }
-  }
-
-  void *gifPsramAlloc(uint32_t size) {
-      return ps_malloc(size);
-  }
-
-  void gifPsramFree(void *p) {
-      if (p) free(p);
-  }
-
-  void freeGifPSRAMData() {
-      if (gifDataPSRAM) {
-          free(gifDataPSRAM);
-          gifDataPSRAM = NULL;
-      }
-      gifDataPSRAMSize = 0;
-  }
-
-  bool preloadGifToPSRAM(const String& path) {
-      freeGifPSRAMData();
-
-      File f = SD.open(path, FILE_READ);
-      if (!f) {
-          return false;
-      }
-
-      size_t fSize = f.size();
-      if (fSize == 0) {
-          f.close();
-          return false;
-      }
-
-      // Sisakan headroom PSRAM agar decoder + stack tetap aman.
-      const size_t reservePSRAM = 256 * 1024;
-      size_t freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-      if (fSize + reservePSRAM > freePSRAM) {
-          f.close();
-          return false;
-      }
-
-      uint8_t *buf = (uint8_t*)ps_malloc(fSize);
-      if (!buf) {
-          f.close();
-          return false;
-      }
-
-      size_t totalRead = 0;
-      while (totalRead < fSize) {
-          size_t chunk = (fSize - totalRead > 8192) ? 8192 : (fSize - totalRead);
-          int n = f.read(buf + totalRead, chunk);
-          if (n <= 0) {
-              break;
-          }
-          totalRead += (size_t)n;
-      }
-      f.close();
-
-      if (totalRead != fSize) {
-          free(buf);
-          return false;
-      }
-
-      gifDataPSRAM = buf;
-      gifDataPSRAMSize = fSize;
-      return true;
-  }
-
-  bool peekGifCanvasSize(const String& path, uint16_t &w, uint16_t &h) {
-      w = 0;
-      h = 0;
-
-      File f = SD.open(path, FILE_READ);
-      if (!f) {
-          return false;
-      }
-
-      uint8_t hdr[10];
-      int n = f.read(hdr, sizeof(hdr));
-      f.close();
-      if (n < 10) {
-          return false;
-      }
-
-      bool sigOk =
-          (hdr[0] == 'G' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == '8' && (hdr[4] == '7' || hdr[4] == '9') && hdr[5] == 'a');
-      if (!sigOk) {
-          return false;
-      }
-
-      w = (uint16_t)hdr[6] | ((uint16_t)hdr[7] << 8);
-      h = (uint16_t)hdr[8] | ((uint16_t)hdr[9] << 8);
-      return true;
-  }
-
-  const char* gifErrorToString(int err) {
-      switch (err) {
-          case GIF_SUCCESS: return "GIF_SUCCESS";
-          case GIF_DECODE_ERROR: return "GIF_DECODE_ERROR";
-          case GIF_TOO_WIDE: return "GIF_TOO_WIDE";
-          case GIF_INVALID_PARAMETER: return "GIF_INVALID_PARAMETER";
-          case GIF_UNSUPPORTED_FEATURE: return "GIF_UNSUPPORTED_FEATURE";
-          case GIF_FILE_NOT_OPEN: return "GIF_FILE_NOT_OPEN";
-          case GIF_EARLY_EOF: return "GIF_EARLY_EOF";
-          case GIF_EMPTY_FRAME: return "GIF_EMPTY_FRAME";
-          case GIF_BAD_FILE: return "GIF_BAD_FILE";
-          case GIF_ERROR_MEMORY: return "GIF_ERROR_MEMORY";
-          default: return "GIF_UNKNOWN_ERROR";
-      }
-  }
-
-  void *gifOpenFile(const char *filename, int32_t *pFileSize) {
-      if (gifFile) {
-          gifFile.close();
-      }
-      gifFile = SD.open(filename, FILE_READ);
-      if (!gifFile) {
-          return NULL;
-      }
-      *pFileSize = (int32_t)gifFile.size();
-      return (void *)&gifFile;
-  }
-
-  void gifCloseFile(void *pHandle) {
-      File *f = (File *)pHandle;
-      if (f && *f) {
-          f->close();
-      }
-  }
-
-  int32_t gifReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
-      File *f = (File *)pFile->fHandle;
-      if (!f || !(*f)) {
-          return 0;
-      }
-
-      int32_t bytesLeft = pFile->iSize - pFile->iPos;
-      if (bytesLeft <= 0) {
-          return 0;
-      }
-      if (iLen > bytesLeft) {
-          iLen = bytesLeft;
-      }
-
-      int32_t bytesRead = (int32_t)f->read(pBuf, iLen);
-      if (bytesRead < 0) {
-          bytesRead = 0;
-      }
-      pFile->iPos += bytesRead;
-      return bytesRead;
-  }
-
-  int32_t gifSeekFile(GIFFILE *pFile, int32_t iPosition) {
-      File *f = (File *)pFile->fHandle;
-      if (!f || !(*f)) {
-          return 0;
-      }
-      if (!f->seek(iPosition)) {
-          return pFile->iPos;
-      }
-      pFile->iPos = iPosition;
-      return iPosition;
-  }
-
-  bool openGifSource(const String& path, GIF_DRAW_CALLBACK *drawCb) {
-      bool opened = false;
-      if (gifDataPSRAM && gifDataPSRAMSize > 0) {
-          opened = gifPlayer.open(gifDataPSRAM, (int)gifDataPSRAMSize, drawCb);
-      }
-      if (!opened) {
-          opened = gifPlayer.open(path.c_str(), gifOpenFile, gifCloseFile, gifReadFile, gifSeekFile, drawCb);
-      }
-      return opened;
-  }
-
-  void gifDrawCallback(GIFDRAW *pDraw) {
-      int dstY = gifDrawOffsetY + pDraw->iY + pDraw->y;
-      if (dstY < 0 || dstY >= 240) {
-          return;
-      }
-
-      int dstX = gifDrawOffsetX + pDraw->iX;
-      int drawWidth = pDraw->iWidth;
-      int srcOffset = 0;
-
-      if (dstX < 0) {
-          srcOffset = -dstX;
-          drawWidth -= srcOffset;
-          dstX = 0;
-      }
-      if (dstX + drawWidth > 240) {
-          drawWidth = 240 - dstX;
-      }
-      if (drawWidth <= 0) {
-          return;
-      }
-
-      uint8_t *src = pDraw->pPixels + srcOffset;
-      uint16_t *palette = pDraw->pPalette;
-
-      // Compose ke framebuffer penuh dulu, lalu flush 1x per frame di loop utama.
-      // Ini mengurangi tearing dibanding push per-line saat frame masih didecode.
-      if (gifUseCanvasCompose && gifFrameCanvas) {
-          uint16_t *dst = gifFrameCanvas + (dstY * 240) + dstX;
-
-          if (pDraw->ucDisposalMethod == 2) {
-              for (int x = 0; x < drawWidth; x++) {
-                  uint8_t idx = src[x];
-                  if (idx == pDraw->ucTransparent) {
-                      idx = pDraw->ucBackground;
-                  }
-                  dst[x] = palette[idx];
-              }
-          } else if (pDraw->ucHasTransparency) {
-              for (int x = 0; x < drawWidth; x++) {
-                  uint8_t idx = src[x];
-                  if (idx != pDraw->ucTransparent) {
-                      dst[x] = palette[idx];
-                  }
-              }
-          } else {
-              for (int x = 0; x < drawWidth; x++) {
-                  dst[x] = palette[src[x]];
-              }
-          }
-
-          markGifComposeDirtyRect(dstX, dstY, drawWidth, 1);
-          return;
-      }
-
-      display.startWrite();
-
-      if (pDraw->ucDisposalMethod == 2) {
-          for (int x = 0; x < drawWidth; x++) {
-              uint8_t idx = src[x];
-              if (idx == pDraw->ucTransparent) {
-                  idx = pDraw->ucBackground;
-              }
-              gifLineBuffer[x] = palette[idx];
-          }
-          display.setAddrWindow(dstX, dstY, drawWidth, 1);
-          display.writePixels(gifLineBuffer, drawWidth, true, false);
-          display.endWrite();
-          return;
-      }
-
-      if (pDraw->ucHasTransparency) {
-          int x = 0;
-          while (x < drawWidth) {
-              while (x < drawWidth && src[x] == pDraw->ucTransparent) {
-                  x++;
-              }
-              int runStart = x;
-              while (x < drawWidth && src[x] != pDraw->ucTransparent) {
-                  gifLineBuffer[x - runStart] = palette[src[x]];
-                  x++;
-              }
-              int runLen = x - runStart;
-              if (runLen > 0) {
-                  display.setAddrWindow(dstX + runStart, dstY, runLen, 1);
-                  display.writePixels(gifLineBuffer, runLen, true, false);
-              }
-          }
-      } else {
-          for (int x = 0; x < drawWidth; x++) {
-              gifLineBuffer[x] = palette[src[x]];
-          }
-          display.setAddrWindow(dstX, dstY, drawWidth, 1);
-          display.writePixels(gifLineBuffer, drawWidth, true, false);
-      }
-
-      display.endWrite();
-  }
-
-  void showGifFile(String filename) {
-      String path = filename.startsWith("/") ? filename : "/" + filename;
-      String lowerPath = path;
-      lowerPath.toLowerCase();
-      if (!lowerPath.endsWith(".gif")) {
-          Serial.println("GIF: Invalid file type: " + path);
-          return;
-      }
-
-      uint16_t srcW = 0;
-      uint16_t srcH = 0;
-      if (peekGifCanvasSize(path, srcW, srcH)) {
-          Serial.printf("GIF: source canvas=%ux%u\\n", srcW, srcH);
-          if (srcW > MAX_WIDTH) {
-              Serial.printf("GIF: Unsupported width %u (AnimatedGIF max %d).\\n", srcW, MAX_WIDTH);
-              canvas.fillScreen(0);
-              canvas.setCursor(10, 20);
-              canvas.println("GIF TOO WIDE");
-              canvas.setCursor(10, 35);
-              canvas.print(srcW);
-              canvas.print(" > ");
-              canvas.println(MAX_WIDTH);
-              canvasDisplay();
-              delay(1200);
-              return;
-          }
-      }
-
-      canvas.fillScreen(0);
-      canvas.setCursor(10, 20);
-      canvas.println("Playing GIF:");
-      canvas.setCursor(10, 35);
-      String shortName = path.length() > 17 ? "..." + path.substring(path.length() - 14) : path;
-      canvas.println(shortName);
-      canvasDisplay();
-      delay(500);
-
-      display.fillScreen(GC9A01A_BLACK);
-
-      uint32_t prevCpuMhz = getCpuFrequencyMhz();
-      if (prevCpuMhz < 240) {
-          setCpuFrequencyMhz(240);
-      }
-
-      gifPlayer.begin(GIF_PALETTE_RGB565_LE);
-
-      bool turboOk = gifPlayer.allocTurboBuf(gifPsramAlloc);
-      if (turboOk) {
-          Serial.println("GIF: Turbo decode enabled.");
-      }
-
-      bool loadedPSRAM = preloadGifToPSRAM(path);
-      if (loadedPSRAM) {
-          Serial.printf("GIF: Preloaded to PSRAM (%u bytes).\\n", (unsigned int)gifDataPSRAMSize);
-      } else {
-          Serial.println("GIF: PSRAM preload skipped, streaming from SD.");
-      }
-
-      gifUseCookedFrameOutput = false;
-      gifUseCanvasCompose = false;
-      resetGifComposeDirtyRect();
-      int openErr = GIF_SUCCESS;
-
-      bool opened = openGifSource(path, NULL);
-      if (!opened) {
-          openErr = gifPlayer.getLastError();
-      }
-      if (opened) {
-          int canvasW = gifPlayer.getCanvasWidth();
-          int canvasH = gifPlayer.getCanvasHeight();
-          size_t cookedBufSize = (size_t)canvasW * (size_t)canvasH * 3;
-
-          if (ensureGifCookedFrameBuffer(cookedBufSize)) {
-              gifPlayer.setFrameBuf(gifCookedFrameBuffer);
-              gifPlayer.setDrawType(GIF_DRAW_COOKED);
-              gifUseCookedFrameOutput = true;
-              Serial.printf("GIF: COOKED full-frame ON (%u bytes).\\n", (unsigned int)cookedBufSize);
-          } else {
-              Serial.printf("GIF: COOKED buffer OOM (%u bytes), fallback RAW callback.\\n", (unsigned int)cookedBufSize);
-              gifPlayer.close();
-              opened = false;
-              openErr = GIF_ERROR_MEMORY;
-          }
-      }
-
-      if (!opened) {
-          prepareGifComposeCanvas();
-          opened = openGifSource(path, gifDrawCallback);
-          if (opened) {
-              gifPlayer.setDrawType(GIF_DRAW_RAW);
-              Serial.println("GIF: RAW callback mode aktif.");
-          } else {
-              openErr = gifPlayer.getLastError();
-          }
-      }
-
-      if (!opened) {
-          Serial.printf("GIF: Failed to open/decode (err=%d %s): %s\\n", openErr, gifErrorToString(openErr), path.c_str());
-          canvas.fillScreen(0);
-          canvas.setCursor(10, 25);
-          canvas.println("GIF OPEN FAILED");
-          canvas.setCursor(10, 40);
-          canvas.println(gifErrorToString(openErr));
-          canvasDisplay();
-          delay(1200);
-
-          if (turboOk) gifPlayer.freeTurboBuf(gifPsramFree);
-          freeGifPSRAMData();
-          gifUseCanvasCompose = false;
-          if (getCpuFrequencyMhz() != prevCpuMhz) setCpuFrequencyMhz(prevCpuMhz);
-          return;
-      }
-
-      int canvasW = gifPlayer.getCanvasWidth();
-      int canvasH = gifPlayer.getCanvasHeight();
-      if (canvasW == 240 && canvasH == 240) {
-          gifDrawOffsetX = 0;
-          gifDrawOffsetY = 0;
-      } else {
-          gifDrawOffsetX = (240 - canvasW) / 2;
-          gifDrawOffsetY = (240 - canvasH) / 2;
-      }
-      Serial.printf("GIF: canvas=%dx%d offset=(%d,%d)\\n", canvasW, canvasH, gifDrawOffsetX, gifDrawOffsetY);
-      if (gifFpsOverride > 0) {
-          Serial.printf("GIF: FPS override aktif %d fps.\\n", gifFpsOverride);
-      } else {
-          Serial.println("GIF: Timing mengikuti delay frame asli file.");
-      }
-      if (gifUseCookedFrameOutput) {
-          Serial.println("GIF: Render mode COOKED + partial flush.");
-      } else if (gifUseCanvasCompose) {
-          Serial.println("GIF: Render mode RAW compose + partial flush.");
-      } else {
-          Serial.println("GIF: Render mode RAW per-line direct.");
-      }
-      Serial.println("GIF: Tahan BOOT 500ms = kembali.");
-
-      btnHoldStart = 0;
-      btnHoldFired = false;
-      bool exitGif = false;
-            int forcedFrameDelayMs = (gifFpsOverride > 0) ? (1000 / gifFpsOverride) : 0;
-            uint32_t nextFrameDeadline = millis();
-
-      uint32_t perfStartMs = millis();
-      uint32_t renderedFrames = 0;
-
-      while (!exitGif) {
-          // Tetap polling tombol tiap iterasi frame agar hold bisa terdeteksi
-          // walau tidak ada waktu tunggu (mis. decode lambat, waitMs = 0).
-          if (readButtonHeld()) {
-              exitGif = true;
-              break;
-          }
-
-          if (gifUseCanvasCompose && !gifUseCookedFrameOutput) {
-              resetGifComposeDirtyRect();
-          }
-
-          int frameDelayMs = 0;
-          uint32_t frameStartMs = millis();
-
-          if (!gifPlayer.playFrame(false, &frameDelayMs, NULL)) {
-              gifPlayer.reset();
-              if (gifUseCookedFrameOutput && gifCookedFrameBuffer && gifCookedFrameBufferSize > 0) {
-                  memset(gifCookedFrameBuffer, 0, gifCookedFrameBufferSize);
-              } else if (gifUseCanvasCompose && gifFrameCanvas) {
-                  memset(gifFrameCanvas, 0, 115200);
-                  resetGifComposeDirtyRect();
-                  display.fillScreen(GC9A01A_BLACK);
-              }
-              continue;
-          }
-          renderedFrames++;
-
-          if (gifUseCookedFrameOutput && gifCookedFrameBuffer) {
-              flushGifCookedFrameRect(
-                  gifPlayer.getFrameXOff(),
-                  gifPlayer.getFrameYOff(),
-                  gifPlayer.getFrameWidth(),
-                  gifPlayer.getFrameHeight(),
-                  gifPlayer.getCanvasWidth(),
-                  gifPlayer.getCanvasHeight());
-          } else if (gifUseCanvasCompose && gifFrameCanvas) {
-              flushGifComposeDirtyRect();
-          }
-
-          if (readButtonHeld()) {
-              exitGif = true;
-              break;
-          }
-
-          if (gifFpsOverride > 0) {
-              frameDelayMs = 1000 / gifFpsOverride;
-          }
-
-          // Delay 0 biasanya dipakai encoder sebagai "cepat"; beri fallback 10ms agar tidak busy-loop.
-          if (frameDelayMs <= 0) {
-              frameDelayMs = 10;
-          }
-
-          int32_t waitMs;
-          uint32_t nowMs = millis();
-          if (forcedFrameDelayMs > 0) {
-              nextFrameDeadline += (uint32_t)forcedFrameDelayMs;
-              waitMs = (int32_t)(nextFrameDeadline - nowMs);
-              if (waitMs < 0) {
-                  // Sudah telat dari target; reset deadline agar pacing tetap stabil.
-                  nextFrameDeadline = nowMs;
-                  waitMs = 0;
-              }
-          } else {
-              waitMs = frameDelayMs - (int32_t)(nowMs - frameStartMs);
-              if (waitMs < 0) {
-                  waitMs = 0;
-              }
-          }
-
-          uint32_t waitUntil = millis() + (uint32_t)waitMs;
-          while (!exitGif && millis() < waitUntil) {
-              if (readButtonHeld()) {
-                  exitGif = true;
-                  break;
-              }
-              delay(1);
-          }
-
-          if (millis() - perfStartMs >= 1000) {
-              float fps = (renderedFrames * 1000.0f) / (float)(millis() - perfStartMs);
-              if (gifFpsOverride > 0) {
-                  Serial.printf("GIF: real fps %.1f (target %d)\\n", fps, gifFpsOverride);
-              } else {
-                  Serial.printf("GIF: real fps %.1f (native)\\n", fps);
-              }
-              perfStartMs = millis();
-              renderedFrames = 0;
-          }
-      }
-
-      gifPlayer.close();
-      if (turboOk) gifPlayer.freeTurboBuf(gifPsramFree);
-      freeGifPSRAMData();
-      gifUseCanvasCompose = false;
-      gifUseCookedFrameOutput = false;
-      if (getCpuFrequencyMhz() != prevCpuMhz) setCpuFrequencyMhz(prevCpuMhz);
-      display.fillScreen(GC9A01A_BLACK);
-  }
-
-  void playBinFrames(String selection) {
-      String folder = selection;
-      if (folder.endsWith("/")) folder.remove(folder.length()-1);
-      String fullPath = "/" + folder;
-
-      if (currentlyLoadedFolder != fullPath) {
-          clearPSRAMCache();
-          canvas.fillScreen(0);
-          canvas.setCursor(10, 20);
-          canvas.println("Loading PSRAM...");
-          canvas.setCursor(10, 30);
-          canvas.println(folder);
-          canvasDisplay();
-
-          String seqExt = "";
-          int frameCount = 0;
-          int firstFrameIdx = -1;
-          File dir = SD.open(fullPath);
-          if (dir) {
-              File entry = dir.openNextFile();
-              while (entry) {
-                  String ename = String(entry.name());
-                  String elow = ename; elow.toLowerCase();
-                  if (elow.startsWith("frame") && (elow.endsWith(".bin") || elow.endsWith(".qoi"))) {
-                      frameCount++;
-                      int idx = elow.substring(5, 9).toInt();
-                      if (firstFrameIdx == -1 || idx < firstFrameIdx) {
-                          firstFrameIdx = idx;
-                          seqExt = ename.substring(ename.lastIndexOf('.')); // Keep exact casing of the first found file
-                      }
-                  }
-                  entry = dir.openNextFile();
-              }
-              dir.close();
-          }
-
-          if (frameCount > MAX_PSRAM_FRAMES) frameCount = MAX_PSRAM_FRAMES;
-          bool isQoiSeq = seqExt.equalsIgnoreCase(".qoi");
-
-          if (firstFrameIdx != -1) {
-              for (int i = 0; i < frameCount; i++) {
-                  if (seqExt == "") break;
-                  char frameName[32];
-                  sprintf(frameName, "/frame%04d", firstFrameIdx + i);
-                  String framePath = fullPath + String(frameName) + seqExt;
-                  
-                  File f = SD.open(framePath, "r");
-                  if (!f) continue;
-
-              size_t fSize = f.size();
-              // Hide redundant logs for frames
-              
-              // Safeguard: Check if PSRAM has enough space (need ~115KB)
-              size_t freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-              if (freePSRAM < 131072) { // Less than 128KB free
-                  Serial.println("PSRAM: Almost full, stopping load.");
-                  f.close();
-                  break;
-              }
-
-              if (i == 0) {
-                  String fmt = isQoiSeq ? "QOI Anim" : getBinFormatName(fSize);
-                  Serial.println("PSRAM: Anim Format: " + fmt);
-                  canvas.setCursor(10, 45);
-                  canvas.print("Fmt: "); canvas.println(fmt);
-                  canvasDisplay();
-              }
-
-              psramFrames[i] = (uint16_t*)ps_malloc(115200);
-              if (psramFrames[i] == NULL) { Serial.println("PSRAM: OOM!"); f.close(); break; }
-
-              if (isQoiSeq) {
-                  decodeQOI(f, psramFrames[i]);
-              } else if (fSize >= 230400) { // 32-bit RGBA
-                  if (fSize > 230400) f.seek(fSize - 230400);
-                  uint8_t r_buf[240*4];
-                  for (int y = 0; y < 240; y++) {
-                      f.read(r_buf, 240*4);
-                      for (int x = 0; x < 240; x++) {
-                          uint8_t r = r_buf[x*4+0], g = r_buf[x*4+1], b = r_buf[x*4+2];
-                          uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                          psramFrames[i][y*240+x] = color;
-                      }
-                  }
-              } else if (fSize >= 172800) { // 24-bit RGB
-                  if (fSize > 172800) f.seek(fSize - 172800);
-                  uint8_t r_buf[240*3];
-                  for (int y = 0; y < 240; y++) {
-                      f.read(r_buf, 240*3);
-                      for (int x = 0; x < 240; x++) {
-                          uint8_t r = r_buf[x*3+0], g = r_buf[x*3+1], b = r_buf[x*3+2];
-                          uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                          psramFrames[i][y*240+x] = color;
-                      }
-                  }
-              } else if (fSize >= 7200 && fSize < 10000) {
-                  // 1-bit Monochrome
-                  if (fSize > 7200) f.seek(fSize - 7200);
-                  uint8_t* bits = (uint8_t*)malloc(7200);
-                  if (bits) {
-                      f.read(bits, 7200);
-                      for (int j = 0; j < 57600; j++) {
-                          int byteIdx = j / 8;
-                          int bitIdx = 7 - (j % 8);
-                          bool pixel = (bits[byteIdx] >> bitIdx) & 0x01;
-                          psramFrames[i][j] = pixel ? 0xFFFF : 0x0000;
-                      }
-                      free(bits);
-                  }
-              } else {
-                  // If source is already 16-bit (115200 bytes), skip potential header
-                  if (fSize > 115200) f.seek(fSize - 115200);
-
-                  // Gunakan internal DMA buffer 8KB agar pembacaan dari SD Card via VFS jauh lebih cepat
-                  // daripada f.read() langsung ke pointer PSRAM (yang terpecah dan mematikan DMA direct).
-                  uint8_t* dmaBuf = (uint8_t*)malloc(8192);
-                  if (dmaBuf) {
-                      for(int offset = 0; offset < 115200; offset += 8192) {
-                          int chunk = (115200 - offset > 8192) ? 8192 : (115200 - offset);
-                          f.read(dmaBuf, chunk);
-                          memcpy((uint8_t*)psramFrames[i] + offset, dmaBuf, chunk);
-                      }
-                      free(dmaBuf);
-                  } else {
-                      f.read((uint8_t*)psramFrames[i], 115200);
-                  }
-
-                  // Super-fast 32-bit swap bytes
-                  uint32_t* p32 = (uint32_t*)psramFrames[i];
-                  for(int p=0; p<28800; p++) {
-                      uint32_t c = p32[p];
-                      p32[p] = ((c & 0x00FF00FF) << 8) | ((c & 0xFF00FF00) >> 8);
-                  }
-              }
-              f.close();
-              totalLoadedFrames++;
-          }
-          }
-          currentlyLoadedFolder = fullPath;
-      }
-
-      // FPS dari pilihan user
-      int32_t binDelayMs = 1000 / gifFps;
-      Serial.printf("MEDIA: Playing at %dfps (interval=%dms)\n", gifFps, binDelayMs);
-
-      // Reset hold detector
-      btnHoldStart = 0;
-      btnHoldFired = false;
-
-      bool exitBin = false;
-      int currentFrame = 0;
-      uint32_t nextFrameTime = millis();
-      
-      while (!exitBin) {
-          if (totalLoadedFrames > 0) {
-              display.drawRGBBitmap(0, 0, psramFrames[currentFrame], 240, 240);
-              currentFrame = (currentFrame + 1) % totalLoadedFrames;
-          }
-          
-          nextFrameTime += binDelayMs;
-          
-          // Always check button at least once per frame, even if draw time is long
-          if (readButtonHeld()) exitBin = true;
-          
-          // Precise jitter-free wait using absolute future time
-          while (!exitBin && (millis() < nextFrameTime)) {
-              yield(); // Let system headers run
-              if (readButtonHeld()) {
-                  exitBin = true;
-                  break;
-              }
-          }
-          
-          // If we fell way behind, resync the clock to prevent fast-forwarding
-          if (millis() > nextFrameTime + binDelayMs) {
-              nextFrameTime = millis();
-          }
-      }
-      display.fillScreen(GC9A01A_BLACK);
-  }
-
-  void drawMenu() {
-    canvas.fillScreen(0); // clear virtual buffer
-    canvas.setTextSize(1);
-    canvas.setTextColor(1); // WHITE for monochrome canvas
-
-        if (menuState == 0) {
-            String title = "=== MAIN MENU ===";
-            int16_t x1, y1; uint16_t w, h;
-            canvas.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
-            canvas.setCursor((SCREEN_WIDTH - w)/2, 0);
-            canvas.println(title);
-      
-            int startObj = menuIndex - 4;
-            if (startObj < 0) startObj = 0;
-            for (int i = startObj, j = 0; i < mainMenuCount && j < 5; i++, j++) {
-                canvas.setCursor(0, (j + 1) * 10 + 5);
-                if (i == menuIndex) canvas.print("> ");
-                else canvas.print("  ");
-                canvas.print(mainMenuList[i]);
-            }
-        } else if (menuState == 1) {
-            if (folderCount == 0 || (folderCount == 2 && folderList[1] == "(No Media)")) {
-                canvas.setCursor(0, 20);
-                canvas.println("NO MEDIA FOUND!");
-                canvas.println("Upload .bin/.qoi/.gif");
-                canvas.setCursor(0, 50);
-                canvas.println("> Back (2x Click)");
-            } else {
-                int startObj = menuIndex - 4;
-                if (startObj < 0) startObj = 0;
-                for (int i = startObj, j = 0; i < folderCount && j < 5; i++, j++) {
-                    canvas.setCursor(0, (j + 1) * 10 + 5);
-                    if (i == menuIndex) canvas.print("> ");
-                    else canvas.print("  ");
-                    String s = folderList[i];
-                    if (s.length() > 18) s = s.substring(0, 18);
-                    canvas.print(s);
-                }
-            }
-    } else if (menuState == 2) {
-      // FPS Menu
-      String title2 = "=== PILIH FPS ===";
-      int16_t x1, y1; uint16_t w, h;
-      canvas.getTextBounds(title2, 0, 0, &x1, &y1, &w, &h);
-      canvas.setCursor((SCREEN_WIDTH - w)/2, 0);
-      canvas.println(title2);
-            if (selectedMediaIsGif) {
-                const char* fpsOptsGif[] = {"ASLI GIF", "15 FPS", "30 FPS", "60 FPS"};
-                for (int i = 0; i < 4; i++) {
-                    canvas.setCursor(0, (i + 1) * 12 + 8);
-                    if (i == menuIndex) canvas.print("> ");
-                    else canvas.print("  ");
-                    canvas.print(fpsOptsGif[i]);
-
-                    if (i == 0 && gifFpsOverride == 0) canvas.print(" *");
-                    if (i == 1 && gifFpsOverride == 15) canvas.print(" *");
-                    if (i == 2 && gifFpsOverride == 30) canvas.print(" *");
-                    if (i == 3 && gifFpsOverride == 60) canvas.print(" *");
-                }
-            } else {
-                const char* fpsOpts[] = {"15 FPS", "30 FPS", "60 FPS"};
-                for (int i = 0; i < 3; i++) {
-                    canvas.setCursor(0, (i + 1) * 12 + 8);
-                    if (i == menuIndex) canvas.print("> ");
-                    else canvas.print("  ");
-                    canvas.print(fpsOpts[i]);
-                    int thisFps = (i == 0) ? 15 : (i == 1) ? 30 : 60;
-                    if (thisFps == gifFps) canvas.print(" *");
-                }
-            }
-    } else if (menuState == 3) {
-      String title = "=== PILIH WIFI ===";
-      int16_t x1, y1; uint16_t w, h;
-      canvas.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
-      canvas.setCursor((SCREEN_WIDTH - w)/2, 0);
-      canvas.println(title);
-      
-      int startObj = menuIndex - 4;
-      if (startObj < 0) startObj = 0;
-      for (int i = startObj, j = 0; i < wifiCount && j < 5; i++, j++) {
-        canvas.setCursor(0, (j + 1) * 10 + 5);
-        if (i == menuIndex) canvas.print("> ");
-        else canvas.print("  ");
-        String s = wifiList[i];
-        if (s.length() > 18) s = s.substring(0, 18);
-        canvas.print(s);
-      }
-    }
-    
-    canvasDisplay();
-  }
-
-  void showSystemInfo(bool waitForKey) {
-    float totalRAM = ESP.getHeapSize() / (1024.0 * 1024.0);
-    float usedRAM  = (ESP.getHeapSize() - ESP.getFreeHeap()) / (1024.0 * 1024.0);
-    int pctRAM = (ESP.getHeapSize() > 0) ? (int)((usedRAM / totalRAM) * 100) : 0;
-
-    float totalPSRAM = ESP.getPsramSize() / (1024.0 * 1024.0);
-    float usedPSRAM  = (ESP.getPsramSize() - ESP.getFreePsram()) / (1024.0 * 1024.0);
-    int pctPSRAM = (ESP.getPsramSize() > 0) ? (int)((usedPSRAM / totalPSRAM) * 100) : 0;
-
-    uint64_t sdTotal = SD.totalBytes();
-    uint64_t sdUsed  = SD.usedBytes();
-    float totalFS = sdTotal / (1024.0 * 1024.0);
-    float usedFS = sdUsed / (1024.0 * 1024.0);
-    int pctFS = (sdTotal > 0) ? (int)((usedFS / totalFS) * 100) : 0;
-
-    canvas.fillScreen(0);
-    canvas.setTextSize(1);
-    canvas.setTextColor(1);
-    
-    String title = "=== SYSTEM INFO ===";
-    int16_t x1, y1; uint16_t w, h;
-    canvas.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
-    canvas.setCursor((SCREEN_WIDTH - w)/2, 0);
-    canvas.println(title);
-
-    canvas.setCursor(0, 15);
-    if (sdTotal == 0 || SD.cardType() == CARD_NONE) {
-        canvas.println("SD : Not Detected");
-    } else {
-        canvas.printf("SD :%.1fM|%.1fM(%d%%)\n", totalFS, usedFS, pctFS);
-    }
-    canvas.printf("RAM:%.2fM|%.2fM(%d%%)\n", totalRAM, usedRAM, pctRAM);
-    
-    if (totalPSRAM > 0) {
-      canvas.printf("PSR:%.1fM|%.1fM(%d%%)\n", totalPSRAM, usedPSRAM, pctPSRAM);
-    } else {
-      canvas.println("PSR: Not Detected");
-    }
-    
-    float espTemp = temperatureRead();
-    canvas.printf("TMP:%.1f C\n", espTemp);
-
-    if (waitForKey) {
-        canvas.setCursor(0, 50);
-        canvas.println("> Press Any Btn <");
-    } else {
-        canvas.setCursor(0, 50);
-        canvas.println("Booting System...");
-    }
-    
-    canvasDisplay();
-
-    if (waitForKey) {
-        delay(300); // debounce
-        while (true) {
-            int btn = readButtonState();
-            if (btn == 2) break;
-            yield();
-        }
-    }
-  }
-// =====================================================================
-// REAL-TIME CLOCK UI (LVGL)
-// =====================================================================
-
-// LVGL Flush function
-void my_disp_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
-{
-    uint32_t w = lv_area_get_width(area);
-    uint32_t h = lv_area_get_height(area);
-    display.drawRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
-    lv_display_flush_ready(disp);
-}
-
-void runRealtimeClock() {
-    display.fillScreen(GC9A01A_BLACK);
-    show_lvgl_clock();
-
-    // --- BACKGROUND WIFI & NTP (only in clock mode) ---
-    static bool ntpEverSynced = false;
-    static uint32_t lastNtpSyncMs = 0;
-    static uint32_t lastWifiBegin = 0;
-    static bool clockWifiActive = false;
-
-    struct tm t_init;
-    bool initHasTime = getLocalTime(&t_init, 0);
-    uint32_t now_entry = millis();
-    bool needResync = !ntpEverSynced || (now_entry - lastNtpSyncMs > 3600000UL); // resync after 1 hour
-
-    if (needResync && !clockWifiActive) {
-        clockWifiActive = true;
-        WiFi.persistent(true);
-        WiFi.setAutoReconnect(true);
-        WiFi.mode(WIFI_STA);
-        WiFi.setSleep(false);
-        WiFi.setTxPower(WIFI_POWER_19_5dBm);
-        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-        WiFi.begin("M.Jarez", "samsito140671");
-        lastWifiBegin = now_entry;
-        Serial.printf("[Clock] Starting WiFi for NTP. Synced before: %d, last sync: %lums ago\n",
-            ntpEverSynced, now_entry - lastNtpSyncMs);
-    } else if (!needResync) {
-        Serial.println("[Clock] NTP already synced recently, skipping WiFi.");
-    }
-
-    uint32_t lastNtpAttempt = 0;
-    uint32_t last_lv_tick = millis();
-    
-    while (true) {
-        uint32_t now = millis();
-        if (readButtonHeld()) break; // Tahan tombol exit
-
-        // --- BACKGROUND LOGIC ---
-        struct tm t;
-        bool hasTime = getLocalTime(&t, 0);
-        if (!hasTime && ntpEverSynced) {
-            hasTime = getLocalTime(&t, 2);
-        }
-        
-        wl_status_t wfStatus = WiFi.status();
-
-        static uint32_t lastRetry = 0;
-        if (clockWifiActive && !hasTime && wfStatus != WL_CONNECTED && (now - lastWifiBegin > 20000) && (now - lastRetry > 20000)) {
-            lastRetry = now;
-            WiFi.disconnect();
-            delay(200);
-            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-            WiFi.begin("M.Jarez", "samsito140671");
-            lastWifiBegin = now;
-        }
-        
-        if (clockWifiActive && !hasTime && wfStatus == WL_CONNECTED && (now - lastNtpAttempt > 5000)) {
-            lastNtpAttempt = now;
-            configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
-        }
-        
-        if (hasTime && true) {
-            ntpEverSynced = true;
-            lastNtpSyncMs = millis();
-            clockWifiActive = false;
-            if (WiFi.getMode() != WIFI_OFF) {
-                WiFi.disconnect(true);
-                WiFi.mode(WIFI_OFF);
-            }
-        }
-
-        // --- UPDATE LVGL OBJECTS ---
-        char dStr[32];
-        if (hasTime) {
-            const char * days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-            const char * months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-            snprintf(dStr, sizeof(dStr), "%s, %02d %s %04d", days[t.tm_wday], t.tm_mday, months[t.tm_mon], t.tm_year + 1900);
-            set_clock_time(t.tm_hour, t.tm_min, t.tm_sec, dStr);
-        } else {
-            if (wfStatus == WL_CONNECTED) {
-                snprintf(dStr, sizeof(dStr), "SYNCING TIME...");
-            } else if (wfStatus == WL_NO_SSID_AVAIL) {
-                snprintf(dStr, sizeof(dStr), "SSID NOT FOUND");
-            } else if (wfStatus == WL_CONNECT_FAILED) {
-                snprintf(dStr, sizeof(dStr), "CONN FAILED");
-            } else {
-                snprintf(dStr, sizeof(dStr), "CONNECTING WIFI...");
-            }
-            // Dummy time while connecting
-            set_clock_time(10, 8, 38, dStr);
-        }
-
-        lv_tick_inc(millis() - last_lv_tick);
-        last_lv_tick = millis();
-        lv_timer_handler();
-
-        yield();
-    }
-    
-    // Sembunyikan elemen jam sebelum keluar dari menu (agar UI tdk bocor ke GFX)
-    hide_lvgl_clock();
-
-    if (WiFi.getMode() != WIFI_OFF) {
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-    }
-    clockWifiActive = false; 
-    neopixelWrite(48, 0, 0, 0);
-}
-
-
-
-  // No legacy RGB buffer needed
-
-  // Legacy viewers removed
-
-  // Legacy viewers and callbacks removed
-  // Legacy GIF and Boot animation removed
-
-  // ===================================
-  // API & Handlers for Web Upload
-  // ===================================
-
-  void sendJsonResponse(int code, String json) {
-      server.send(code, "application/json", json);
-  }
-
-  void handleStatus() {
-      float totalFS = SD.totalBytes() / (1024.0 * 1024.0);
-      float usedFS = SD.usedBytes() / (1024.0 * 1024.0);
-      float freeFS = totalFS - usedFS;
-      float totalRAM = ESP.getHeapSize() / 1024.0;
-      float freeRAM = ESP.getFreeHeap() / 1024.0;
-      float espTempC = temperatureRead();
-      
-      String json = "{";
-      json += "\"status\":\"ok\",";
-      json += "\"fs_total_mb\":" + String(totalFS, 2) + ",";
-      json += "\"fs_used_mb\":" + String(usedFS, 2) + ",";
-      json += "\"fs_free_mb\":" + String(freeFS, 2) + ",";
-      json += "\"ram_total_kb\":" + String(totalRAM, 2) + ",";
-      json += "\"ram_free_kb\":" + String(freeRAM, 2) + ",";
-      json += "\"temp_c\":" + String(espTempC, 2);
-      json += "}";
-      sendJsonResponse(200, json);
-  }
-
-  void handleList() {
-      String json = "{\"files\":[";
-      File root = SD.open("/");
-      File file = root.openNextFile();
-      bool first = true;
-      while (file) {
-          if (!first) json += ",";
-          json += "{\"name\":\"" + String(file.name()) + "\",";
-          json += "\"is_dir\":" + String(file.isDirectory() ? "true" : "false") + ",";
-          json += "\"size\":" + String(file.size()) + "}";
-          first = false;
-          file = root.openNextFile();
-      }
-      json += "]}";
-      sendJsonResponse(200, json);
-  }
-
-  void recursiveDelete(String path) {
-      File dir = SD.open(path);
-      if (!dir) return;
-      if (!dir.isDirectory()) {
-          dir.close();
-          SD.remove(path);
-          return;
-      }
-      
-      File file = dir.openNextFile();
-      while (file) {
-          String childPath = String(file.name());
-          if (!childPath.startsWith(path)) {
-              if (path.endsWith("/")) childPath = path + childPath;
-              else childPath = path + "/" + childPath;
-          }
-          bool isDir = file.isDirectory();
-          file.close();
-
-          if (isDir) {
-              recursiveDelete(childPath);
-          } else {
-              SD.remove(childPath);
-          }
-          
-          dir = SD.open(path); 
-          if (!dir) break;
-          file = dir.openNextFile(); 
-      }
-      dir.close();
-      SD.rmdir(path);
-  }
-
-  // Returns true if format succeeded
-  bool performRealFormat() {
-    Serial.println("[SD] Starting Real Format (FAT32)...");
-    SD.end(); // Tutup koneksi SD.h
-    delay(500);
-
-    // Re-initialize SPI bus for SD Card since SD.end() might mess it up
-    SPI.end();
-    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
-    delay(100);
-
-    // Gunakan SdFs (support FAT + exFAT) agar SDXC 64GB+ bisa diinisialisasi
-    SdFs sd_fat;
-    if (!sd_fat.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(16), &SPI))) {
-      Serial.println("[SD] SdFat: Hardware init FAILED!");
-      return false;
-    }
-
-    // Gunakan FatFormatter untuk MEMAKSA format FAT32 pada kartu ukuran apapun
-    // (termasuk SDXC 64GB/128GB yang biasanya exFAT)
-    FatFormatter fatFormatter;
-    uint8_t secBuf[512];
-    Serial.println("[SD] Formatting to FAT32 (forced)...");
-    if (!fatFormatter.format(sd_fat.card(), secBuf, &Serial)) {
-      Serial.println("[SD] SD Format FAILED!");
-      return false;
-    }
-    
-    Serial.println("[SD] SD Format SUCCESS!");
-    sd_fat.end(); // Tutup SdFat
-    delay(500);
-
-    // Reset SD card state: toggle CS & re-init SPI bus
-    digitalWrite(SD_CS, HIGH);
-    SPI.end();
-    delay(500);
-    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
-    delay(500);
-
-    // Coba remount dengan SD.h langsung (retry 5x)
-    bool mounted = false;
-    for (int i = 1; i <= 5; i++) {
-      Serial.printf("[SD] Remount attempt %d/5...\n", i);
-      if (SD.begin(SD_CS, SPI, 40000000)) {
-        mounted = true;
-        break;
-      }
-      SD.end();
-      delay(1000);
-      SPI.end();
-      SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
-      delay(300);
-    }
-
-    if (mounted) {
-      uint8_t cardType = SD.cardType();
-      const char* typeStr = (cardType == CARD_MMC) ? "MMC" :
-                            (cardType == CARD_SD)  ? "SDSC" :
-                            (cardType == CARD_SDHC)? "SDHC" : "UNKNOWN";
-      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-      Serial.printf("[SD] Remounted OK! Type: %s | Size: %lluMB\n", typeStr, cardSize);
-    } else {
-      Serial.println("[SD] Remount failed. Tekan tombol RESET fisik untuk apply format.");
-    }
-    return true;
-  }
-
-  void handleDelete() {
-      if (!server.hasArg("path")) {
-          sendJsonResponse(400, "{\"error\":\"missing path\"}");
-          return;
-      }
-      String path = server.arg("path");
-      if (!path.startsWith("/")) path = "/" + path;
-      
-      if (SD.exists(path)) {
-          File f = SD.open(path, "r");
-          bool isDir = false;
-          if (f) {
-              isDir = f.isDirectory();
-              f.close();
-          }
-          
-          if (isDir) {
-              recursiveDelete(path);
-              sendJsonResponse(200, "{\"status\":\"deleted\"}");
-          } else {
-              if (SD.remove(path)) {
-                  sendJsonResponse(200, "{\"status\":\"deleted\"}");
-              } else {
-                  sendJsonResponse(500, "{\"error\":\"delete failed\"}");
-              }
-          }
-      } else {
-          sendJsonResponse(404, "{\"error\":\"not found\"}");
-      }
-  }
-
-  void handleFileUpload() {
-      HTTPUpload& upload = server.upload();
-      static File fsUploadFile;
-      
-      // Fast Upload DMA Write Buffer
-      static uint8_t* writeBuffer = nullptr;
-      static size_t writeBufferLen = 0;
-      const size_t WRITE_BUFFER_MAX = 16384; // 16KB buffer
-      
-      if (upload.status == UPLOAD_FILE_START) {
-          String filename = upload.filename;
-          if (!filename.startsWith("/")) filename = "/" + filename;
-          
-          // Create directories if they don't exist
-          int lastSlash = filename.lastIndexOf('/');
-          if (lastSlash > 0) {
-              String dirPath = filename.substring(0, lastSlash);
-              if (!SD.exists(dirPath)) {
-                  SD.mkdir(dirPath);
-              }
-          }
-
-          fsUploadFile = SD.open(filename, FILE_WRITE);
-          
-          if (!writeBuffer) writeBuffer = (uint8_t*)malloc(WRITE_BUFFER_MAX);
-          writeBufferLen = 0;
-
-          Serial.print("Upload Start: "); Serial.println(filename);
-
-          canvas.fillScreen(0);
-          canvas.setTextSize(1);
-          canvas.setCursor(10, 20);
-          canvas.println("WRITING...");
-          canvas.setCursor(10, 30);
-          String shortName = filename.length() > 20 ? "..." + filename.substring(filename.length()-17) : filename;
-          canvas.println(shortName);
-          canvasDisplay();
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-          if (fsUploadFile && writeBuffer) {
-              size_t offset = 0;
-              while (offset < upload.currentSize) {
-                  size_t copyLen = upload.currentSize - offset;
-                  if (writeBufferLen + copyLen > WRITE_BUFFER_MAX) {
-                      copyLen = WRITE_BUFFER_MAX - writeBufferLen;
-                  }
-                  memcpy(writeBuffer + writeBufferLen, upload.buf + offset, copyLen);
-                  writeBufferLen += copyLen;
-                  offset += copyLen;
-                  
-                  if (writeBufferLen == WRITE_BUFFER_MAX) {
-                      fsUploadFile.write(writeBuffer, WRITE_BUFFER_MAX);
-                      writeBufferLen = 0;
-                  }
-              }
-          } else if (fsUploadFile) {
-              fsUploadFile.write(upload.buf, upload.currentSize);
-          }
-      } else if (upload.status == UPLOAD_FILE_END) {
-          if (fsUploadFile) {
-              if (writeBuffer && writeBufferLen > 0) {
-                  fsUploadFile.write(writeBuffer, writeBufferLen);
-                  writeBufferLen = 0;
-              }
-              fsUploadFile.close();
-              if (writeBuffer) {
-                  free(writeBuffer);
-                  writeBuffer = nullptr;
-              }
-              Serial.print("Upload Size: "); Serial.println(upload.totalSize);
-          }
-          
-          if (server.args() == 0) { // Check if this is the last part
-             // We don't send response yet as there might be more files in the batch
-          }
-      }
-
-  }
-
-  void runMediaUploaderServer() {
-      isWebUploadMode = true;
-      
-      // Disconnect from STA first to ensure clean AP start
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_AP);
-      
-      // OPTIMASI: Kencangkan transfer rate WiFi mentok!
-      esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-      WiFi.setSleep(false);
-      WiFi.setTxPower(WIFI_POWER_19_5dBm);
-      
-      // Configure explicit IP to prevent DHCP issues on some phones
-      IPAddress apIP(192, 168, 4, 1);
-      WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-      
-      // Start AP on channel 6
-      WiFi.softAP("ESP32-Media-App", "12345678", 6);
-
-      // Setup mDNS
-      if (MDNS.begin("ganci")) {
-          Serial.println("mDNS responder started: ganci.local");
-      }
-
-      server.on("/status", HTTP_GET, handleStatus);
-      server.on("/list", HTTP_GET, handleList);
-      server.on("/delete", HTTP_POST, handleDelete);
-      server.on("/upload", HTTP_POST, []() {
-          sendJsonResponse(200, "{\"status\":\"success\"}");
-      }, handleFileUpload);
-
-      server.onNotFound([]() {
-          sendJsonResponse(404, "{\"error\":\"not found\"}");
-      });
-      server.begin();
-
-      // Show IP on screen
-      String ip = WiFi.softAPIP().toString();
-      
-      while(true) {
-          dnsServer.processNextRequest();
-          server.handleClient();
-          
-          canvas.fillScreen(0);
-          canvas.setTextSize(1);
-          canvas.setCursor(0, 0);
-          canvas.println("ANDROID API MODE");
-          canvas.setCursor(0, 15);
-          canvas.print("Wi-Fi: ");
-          canvas.println("ESP32-Media-App");
-          canvas.setCursor(0, 30);
-          canvas.print("MDNS : "); canvas.println("ganci.local");
-          canvas.setCursor(0, 45);
-          canvas.print("IP   : "); canvas.print(ip);
-          canvas.setCursor(0, 60);
-          canvas.println("2x Klik = Batal");
-          canvasDisplay();
-          
-          int btn = readButtonState();
-          if (btn == 2) {
-              // exit on double tab
-              server.stop();
-              WiFi.mode(WIFI_STA);
-              isWebUploadMode = false;
-              break; 
-          }
-          yield();
-      }
-  }
-
-  // ===================================
-  // MAIN SYSTEM
-  // ===================================
+#include "app/core/app_config.h"
+#include "app/core/app_state.h"
+#include "app/input/input.h"
+#include "app/ui/ui_canvas.h"
+#include "app/media/media_bin.h"
+#include "app/media/media_gif.h"
+#include "app/clock/clock_lvgl.h"
+#include "app/net/web_uploader.h"
+#include "app/net/ntp_time.h"
+#include "SpotifyRemote.h"
 
 void setup() {
-
     Serial.begin(115200);
     pinMode(TOUCH_PIN, INPUT);
 
@@ -1898,7 +29,7 @@ void setup() {
     // WiFi hanya konek saat diperlukan (Clock mode) - tidak konek saat boot
     WiFi.mode(WIFI_OFF);
 
-    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI); 
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
     display.begin(80000000); // 80MHz for Display
     setCpuFrequencyMhz(160); // Boost to 160MHz for better stability
     display.setRotation(0);
@@ -1923,7 +54,7 @@ void setup() {
     // Mount SD Card - explicit SPI bus & safe frequency for initial handshake
     Serial.println("[SD] Attempting SD card init...");
     Serial.printf("[SD] Pins: CS=%d, SCK=%d, MISO=%d, MOSI=%d\n", SD_CS, TFT_SCLK, TFT_MISO, TFT_MOSI);
-    
+
     bool sdMounted = false;
     for (int attempt = 1; attempt <= 3; attempt++) {
         Serial.printf("[SD] Mount attempt %d/3...\n", attempt);
@@ -1938,7 +69,7 @@ void setup() {
         SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
         delay(200);
     }
-    
+
     if (!sdMounted) {
         Serial.println("[SD] Mount FAILED after 3 attempts! Check: wiring, card format (FAT32), card inserted?");
         canvas.fillScreen(0);
@@ -1962,9 +93,9 @@ void setup() {
     drawMenu();
 
     Serial.println("\n=== Gunakan BOOT button: 1x Klik = NEXT, 2x Klik = ENTER | Tahan 500ms = Exit Media ===");
-  }
+}
 
-  void loop() {
+void loop() {
     // ============================================================
     // AUTO-SYNC NTP: Non-blocking 3-state machine
     //   State 0 = IDLE (tunggu interval)
@@ -1984,317 +115,316 @@ void setup() {
     }
 
     if (nextTriggered) {
-      if (menuState == 0) {
-        menuIndex++;
-        if (menuIndex >= mainMenuCount) menuIndex = 0;
-      } else if (menuState == 1) {
-        menuIndex++;
-        if (menuIndex >= folderCount) menuIndex = 0;
-      } else if (menuState == 2) {
-        menuIndex++;
-                int maxFpsMenu = selectedMediaIsGif ? 4 : 3;
-                if (menuIndex >= maxFpsMenu) menuIndex = 0;
-      } else if (menuState == 3) {
-        menuIndex++;
-        if (menuIndex >= wifiCount) menuIndex = 0;
-      }
-      drawMenu();
+        if (menuState == 0) {
+            menuIndex++;
+            if (menuIndex >= mainMenuCount) menuIndex = 0;
+        } else if (menuState == 1) {
+            menuIndex++;
+            if (menuIndex >= folderCount) menuIndex = 0;
+        } else if (menuState == 2) {
+            menuIndex++;
+            int maxFpsMenu = selectedMediaIsGif ? 4 : 3;
+            if (menuIndex >= maxFpsMenu) menuIndex = 0;
+        } else if (menuState == 3) {
+            menuIndex++;
+            if (menuIndex >= wifiCount) menuIndex = 0;
+        }
+        drawMenu();
     }
 
     if (enterTriggered) {
-      if (menuState == 0) {
-        if (menuIndex == 0) {
-          // Jam Realtime
-          runRealtimeClock();
-          display.fillScreen(GC9A01A_BLACK);
-          drawMenu();
-        } else if (menuIndex == 1) {
-          // System Info
-          showSystemInfo(true);
-          drawMenu();
-        } else if (menuIndex == 2) {
-          // Play Media -> Masuk menu Folder List dulu sebelum pilih FPS
-          listFolders();
-          menuState = 1;
-          menuIndex = 0;
-          drawMenu();
-        } else if (menuIndex == 3) {
-          // Scan WiFi (set STA mode dulu, lalu bersihkan cache lama)
-          WiFi.mode(WIFI_STA);
-          WiFi.scanDelete();
-          delay(100);
-          int n = WiFi.scanNetworks();
-          wifiCount = 0;
-          wifiList[wifiCount++] = "[ Back ]";
-          for (int i = 0; i < n && wifiCount < 20; ++i) {
-             wifiList[wifiCount++] = WiFi.SSID(i);
-          }
-          menuState = 3;
-          menuIndex = 0; // reset kursor
-          drawMenu();
-        } else if (menuIndex == 4) {
-          // Mode Web Uploader Access Point (Up Media)
-          runMediaUploaderServer();
-          
-          // Kembali ke main menu setelah web server dihentikan
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
-        } else if (menuIndex == 5) {
-          // Spotify Remote - 240x240 Double Buffered to prevent flicker
-          SpotifyRemote.begin();
-          
-          // Allocate 115KB canvas in PSRAM
-          GFXcanvas16* spotifyCanvas = new GFXcanvas16(240, 240);
-          
-          display.fillScreen(GC9A01A_BLACK);
-          while(true) {
-              if (readButtonHeld()) break;
-              int spotifyBtn = readButtonState();
-              if (SpotifyRemote.update(spotifyBtn, spotifyCanvas)) {
-                  // Push the entire 240x240 canvas to screen at once to eliminate flicker
-                  display.drawRGBBitmap(0, 0, spotifyCanvas->getBuffer(), 240, 240);
-              }
-              yield();
-          }
-          delete spotifyCanvas; // Free memory
-          
-          SpotifyRemote.end(); // Stop BLE Server and Advertising
-
-          display.fillScreen(GC9A01A_BLACK);
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
-        } else if (menuIndex == 6) {
-          // Format SD Card
-          canvas.fillScreen(0);
-          canvas.setTextSize(1);
-          canvas.setTextColor(1);
-          canvas.setCursor(0, 5);
-          canvas.println("FORMAT SD CARD?");
-          canvas.setCursor(0, 20);
-          canvas.println("ALL DATA WILL BE");
-          canvas.setCursor(0, 30);
-          canvas.println("DELETED!");
-          canvas.setCursor(0, 45);
-          canvas.println("2xKlik=YA 1x=BATAL");
-          canvasDisplay();
-          
-          // Tunggu konfirmasi
-          delay(300);
-          bool doFormat = false;
-          while (true) {
-              int confirmBtn = readButtonState();
-              if (confirmBtn == 2) { doFormat = true; break; }
-              if (confirmBtn == 1) { break; } // batal
-              yield();
-          }
-          
-          if (doFormat) {
-              canvas.fillScreen(0);
-              canvas.setCursor(10, 20);
-              canvas.println("FORMATTING...");
-              canvas.setCursor(10, 35);
-              canvas.println("Please wait");
-              canvasDisplay();
-              
-              // Melakukan "Real Format" menggunakan SdFat
-              bool ok = performRealFormat();
-              
-              canvas.fillScreen(0);
-              if (ok) {
-                canvas.setCursor(10, 15);
-                canvas.println("FORMAT DONE!");
-                if (SD.cardType() != CARD_NONE) {
-                  canvas.setCursor(10, 30);
-                  canvas.println("SD Card OK!");
-                } else {
-                  canvas.setCursor(10, 30);
-                  canvas.println("Tekan RESET");
-                  canvas.setCursor(10, 40);
-                  canvas.println("untuk apply.");
-                }
-              } else {
-                canvas.setCursor(10, 28);
-                canvas.println("FORMAT FAILED!");
-              }
-              canvasDisplay();
-              delay(3000);
-          }
-          
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
-        } else if (menuIndex == 7) {
-          // Reset System
-          canvas.fillScreen(0);
-          canvas.setTextSize(1);
-          canvas.setTextColor(1);
-          int16_t x1, y1; uint16_t w, h;
-          canvas.getTextBounds("Rebooting...", 0, 0, &x1, &y1, &w, &h);
-          canvas.setCursor((SCREEN_WIDTH - w)/2, 28);
-          canvas.println("Rebooting...");
-          canvasDisplay();
-          delay(1000);
-          
-          // Clear RTC Time before rebooting so it doesn't retain corrupted time
-          struct timeval tv;
-          tv.tv_sec = 0;
-          tv.tv_usec = 0;
-          settimeofday(&tv, NULL);
-          
-          ESP.restart();
-        }
-      } else if (menuState == 2) {
-                // FPS menu untuk GIF atau folder animasi frameXXXX.bin/qoi
-        String selection = selectedMediaParam;
-                if (selectedMediaIsGif) {
-                    int fpsListGif[] = {0, 15, 30, 60}; // 0 = ASLI GIF
-                    gifFpsOverride = fpsListGif[menuIndex];
-                    if (gifFpsOverride > 0) {
-                        Serial.printf("GIF FPS override dipilih: %d\n", gifFpsOverride);
-                    } else {
-                        Serial.println("GIF FPS override: ASLI GIF");
-                    }
-                    showGifFile(selection);
-                } else {
-                    int fpsList[] = {15, 30, 60};
-                    gifFps = fpsList[menuIndex];
-                    Serial.printf("FPS dipilih: %d\n", gifFps);
-                    playBinFrames(selection);
-                }
-
-        // Kembali ke list folder setelah putar media selesai / di-_cancel_
-        listFolders();
-        menuState = 1;
-        menuIndex = 0;
-        drawMenu();
-      } else if (menuState == 1) {
-        if (folderList[menuIndex] == "[ Back ]") {
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
-        } else if (folderList[menuIndex] != "(No Media)") {
-            String selection = folderList[menuIndex];
-            String selLow = selection;
-            selLow.toLowerCase();
-
-            if (selection.endsWith("/")) {
-                // Folder frameXXXX.bin/qoi -> minta FPS manual
-                selectedMediaParam = selection;
-                selectedMediaIsGif = false;
-                menuState = 2;
-                menuIndex = 1; // Default 30 FPS
+        if (menuState == 0) {
+            if (menuIndex == 0) {
+                // Jam Realtime
+                runRealtimeClock();
+                display.fillScreen(GC9A01A_BLACK);
                 drawMenu();
-            } else if (selLow.endsWith(".gif")) {
-                // File GIF -> pilih FPS (ASLI/15/30/60)
-                selectedMediaParam = selection;
-                selectedMediaIsGif = true;
-                menuState = 2;
-                if (gifFpsOverride == 15) menuIndex = 1;
-                else if (gifFpsOverride == 30) menuIndex = 2;
-                else if (gifFpsOverride == 60) menuIndex = 3;
-                else menuIndex = 0; // ASLI GIF
+            } else if (menuIndex == 1) {
+                // System Info
+                showSystemInfo(true);
                 drawMenu();
-            } else {
-                // File .bin/.qoi statis
-                selectedMediaIsGif = false;
-                showBinFile(selection);
+            } else if (menuIndex == 2) {
+                // Play Media -> Masuk menu Folder List dulu sebelum pilih FPS
                 listFolders();
                 menuState = 1;
                 menuIndex = 0;
                 drawMenu();
+            } else if (menuIndex == 3) {
+                // Scan WiFi (set STA mode dulu, lalu bersihkan cache lama)
+                WiFi.mode(WIFI_STA);
+                WiFi.scanDelete();
+                delay(100);
+                int n = WiFi.scanNetworks();
+                wifiCount = 0;
+                wifiList[wifiCount++] = "[ Back ]";
+                for (int i = 0; i < n && wifiCount < 20; ++i) {
+                    wifiList[wifiCount++] = WiFi.SSID(i);
+                }
+                menuState = 3;
+                menuIndex = 0; // reset kursor
+                drawMenu();
+            } else if (menuIndex == 4) {
+                // Mode Web Uploader Access Point (Up Media)
+                runMediaUploaderServer();
+
+                // Kembali ke main menu setelah web server dihentikan
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
+            } else if (menuIndex == 5) {
+                // Spotify Remote - 240x240 Double Buffered to prevent flicker
+                SpotifyRemote.begin();
+
+                // Allocate 115KB canvas in PSRAM
+                GFXcanvas16* spotifyCanvas = new GFXcanvas16(240, 240);
+
+                display.fillScreen(GC9A01A_BLACK);
+                while (true) {
+                    if (readButtonHeld()) break;
+                    int spotifyBtn = readButtonState();
+                    if (SpotifyRemote.update(spotifyBtn, spotifyCanvas)) {
+                        // Push the entire 240x240 canvas to screen at once to eliminate flicker
+                        display.drawRGBBitmap(0, 0, spotifyCanvas->getBuffer(), 240, 240);
+                    }
+                    yield();
+                }
+                delete spotifyCanvas; // Free memory
+
+                SpotifyRemote.end(); // Stop BLE Server and Advertising
+
+                display.fillScreen(GC9A01A_BLACK);
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
+            } else if (menuIndex == 6) {
+                // Format SD Card
+                canvas.fillScreen(0);
+                canvas.setTextSize(1);
+                canvas.setTextColor(1);
+                canvas.setCursor(0, 5);
+                canvas.println("FORMAT SD CARD?");
+                canvas.setCursor(0, 20);
+                canvas.println("ALL DATA WILL BE");
+                canvas.setCursor(0, 30);
+                canvas.println("DELETED!");
+                canvas.setCursor(0, 45);
+                canvas.println("2xKlik=YA 1x=BATAL");
+                canvasDisplay();
+
+                // Tunggu konfirmasi
+                delay(300);
+                bool doFormat = false;
+                while (true) {
+                    int confirmBtn = readButtonState();
+                    if (confirmBtn == 2) { doFormat = true; break; }
+                    if (confirmBtn == 1) { break; } // batal
+                    yield();
+                }
+
+                if (doFormat) {
+                    canvas.fillScreen(0);
+                    canvas.setCursor(10, 20);
+                    canvas.println("FORMATTING...");
+                    canvas.setCursor(10, 35);
+                    canvas.println("Please wait");
+                    canvasDisplay();
+
+                    // Melakukan "Real Format" menggunakan SdFat
+                    bool ok = performRealFormat();
+
+                    canvas.fillScreen(0);
+                    if (ok) {
+                        canvas.setCursor(10, 15);
+                        canvas.println("FORMAT DONE!");
+                        if (SD.cardType() != CARD_NONE) {
+                            canvas.setCursor(10, 30);
+                            canvas.println("SD Card OK!");
+                        } else {
+                            canvas.setCursor(10, 30);
+                            canvas.println("Tekan RESET");
+                            canvas.setCursor(10, 40);
+                            canvas.println("untuk apply.");
+                        }
+                    } else {
+                        canvas.setCursor(10, 28);
+                        canvas.println("FORMAT FAILED!");
+                    }
+                    canvasDisplay();
+                    delay(3000);
+                }
+
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
+            } else if (menuIndex == 7) {
+                // Reset System
+                canvas.fillScreen(0);
+                canvas.setTextSize(1);
+                canvas.setTextColor(1);
+                int16_t x1, y1; uint16_t w, h;
+                canvas.getTextBounds("Rebooting...", 0, 0, &x1, &y1, &w, &h);
+                canvas.setCursor((SCREEN_WIDTH - w) / 2, 28);
+                canvas.println("Rebooting...");
+                canvasDisplay();
+                delay(1000);
+
+                // Clear RTC Time before rebooting so it doesn't retain corrupted time
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+                settimeofday(&tv, NULL);
+
+                ESP.restart();
             }
-        } else {
-            // It is "(No Media)" - Return to main menu
-            menuState = 0;
+        } else if (menuState == 2) {
+            // FPS menu untuk GIF atau folder animasi frameXXXX.bin/qoi
+            String selection = selectedMediaParam;
+            if (selectedMediaIsGif) {
+                int fpsListGif[] = {0, 15, 30, 60}; // 0 = ASLI GIF
+                gifFpsOverride = fpsListGif[menuIndex];
+                if (gifFpsOverride > 0) {
+                    Serial.printf("GIF FPS override dipilih: %d\n", gifFpsOverride);
+                } else {
+                    Serial.println("GIF FPS override: ASLI GIF");
+                }
+                showGifFile(selection);
+            } else {
+                int fpsList[] = {15, 30, 60};
+                gifFps = fpsList[menuIndex];
+                Serial.printf("FPS dipilih: %d\n", gifFps);
+                playBinFrames(selection);
+            }
+
+            // Kembali ke list folder setelah putar media selesai / di-_cancel_
+            listFolders();
+            menuState = 1;
             menuIndex = 0;
             drawMenu();
-        }
-      } else if (menuState == 3) {
-        if (wifiList[menuIndex] == "[ Back ]") {
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
-        } else {
-          String ssid = wifiList[menuIndex];
-          // Fungsi untuk refresh tampilan OLED password entry
-          String ssidDisplay = ssid.length() > 14 ? ssid.substring(0, 13) + "..." : ssid;
-          auto refreshPassScreen = [&](const String& p) {
-              canvas.fillScreen(0);
-              canvas.setTextSize(1);
-              canvas.setTextColor(1);
-              canvas.setCursor(0, 10);
-              canvas.print("SSID : "); canvas.println(ssidDisplay);
-              canvas.setCursor(0, 24);
-              canvas.print("PASS : ");
-              for (int k = 0; k < (int)p.length(); k++) canvas.print("*");
-              canvas.setCursor(0, 44);
-              canvas.println("(Serial Monitor)");
-              canvas.setCursor(0, 54);
-              canvas.println("2x Klik = Batal");
-              canvasDisplay();
-          };
-          String pass = "";
-          refreshPassScreen(pass);
+        } else if (menuState == 1) {
+            if (folderList[menuIndex] == "[ Back ]") {
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
+            } else if (folderList[menuIndex] != "(No Media)") {
+                String selection = folderList[menuIndex];
+                String selLow = selection;
+                selLow.toLowerCase();
 
-          Serial.println();
-          Serial.print(">>> Password untuk '"); Serial.print(ssid); Serial.println("':");
-          Serial.println("(Enter = Kirim, 2x Klik BOOT = Batal)");
-          
-          bool done = false;
-          while(!done) {
-            if(readButtonState() == 2) {
-               pass = "";
-               break; // batal
+                if (selection.endsWith("/")) {
+                    // Folder frameXXXX.bin/qoi -> minta FPS manual
+                    selectedMediaParam = selection;
+                    selectedMediaIsGif = false;
+                    menuState = 2;
+                    menuIndex = 1; // Default 30 FPS
+                    drawMenu();
+                } else if (selLow.endsWith(".gif")) {
+                    // File GIF -> pilih FPS (ASLI/15/30/60)
+                    selectedMediaParam = selection;
+                    selectedMediaIsGif = true;
+                    menuState = 2;
+                    if (gifFpsOverride == 15) menuIndex = 1;
+                    else if (gifFpsOverride == 30) menuIndex = 2;
+                    else if (gifFpsOverride == 60) menuIndex = 3;
+                    else menuIndex = 0; // ASLI GIF
+                    drawMenu();
+                } else {
+                    // File .bin/.qoi statis
+                    selectedMediaIsGif = false;
+                    showBinFile(selection);
+                    listFolders();
+                    menuState = 1;
+                    menuIndex = 0;
+                    drawMenu();
+                }
+            } else {
+                // It is "(No Media)" - Return to main menu
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
             }
-            while(Serial.available()) {
-               char c = Serial.read();
-               if(c == '\n' || c == '\r') {
-                 if(pass.length() > 0) { done = true; break; }
-               } else if (c == 8 || c == 127) { // Backspace handling
-                 if(pass.length() > 0) { pass.remove(pass.length()-1); }
-                 Serial.print("\b \b");
-               } else {
-                 pass += c;
-                 Serial.print('*'); // Echo bintang, bukan karakter aslinya
-               }
-               refreshPassScreen(pass);
+        } else if (menuState == 3) {
+            if (wifiList[menuIndex] == "[ Back ]") {
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
+            } else {
+                String ssid = wifiList[menuIndex];
+                // Fungsi untuk refresh tampilan OLED password entry
+                String ssidDisplay = ssid.length() > 14 ? ssid.substring(0, 13) + "..." : ssid;
+                auto refreshPassScreen = [&](const String& p) {
+                    canvas.fillScreen(0);
+                    canvas.setTextSize(1);
+                    canvas.setTextColor(1);
+                    canvas.setCursor(0, 10);
+                    canvas.print("SSID : "); canvas.println(ssidDisplay);
+                    canvas.setCursor(0, 24);
+                    canvas.print("PASS : ");
+                    for (int k = 0; k < (int)p.length(); k++) canvas.print("*");
+                    canvas.setCursor(0, 44);
+                    canvas.println("(Serial Monitor)");
+                    canvas.setCursor(0, 54);
+                    canvas.println("2x Klik = Batal");
+                    canvasDisplay();
+                };
+                String pass = "";
+                refreshPassScreen(pass);
+
+                Serial.println();
+                Serial.print(">>> Password untuk '"); Serial.print(ssid); Serial.println("':");
+                Serial.println("(Enter = Kirim, 2x Klik BOOT = Batal)");
+
+                bool done = false;
+                while (!done) {
+                    if (readButtonState() == 2) {
+                        pass = "";
+                        break; // batal
+                    }
+                    while (Serial.available()) {
+                        char c = Serial.read();
+                        if (c == '\n' || c == '\r') {
+                            if (pass.length() > 0) { done = true; break; }
+                        } else if (c == 8 || c == 127) { // Backspace handling
+                            if (pass.length() > 0) { pass.remove(pass.length() - 1); }
+                            Serial.print("\b \b");
+                        } else {
+                            pass += c;
+                            Serial.print('*'); // Echo bintang, bukan karakter aslinya
+                        }
+                        refreshPassScreen(pass);
+                    }
+                    yield();
+                }
+                Serial.println(); // Newline setelah bintang-bintang
+
+                pass.trim();
+                if (pass.length() > 0) {
+                    canvas.fillScreen(0);
+                    int16_t x1, y1; uint16_t w, h;
+                    canvas.getTextBounds("Connecting...", 0, 0, &x1, &y1, &w, &h);
+                    canvas.setCursor((SCREEN_WIDTH - w) / 2, 28);
+                    canvas.println("Connecting...");
+                    canvasDisplay();
+
+                    bool success = connectToNewWiFi(ssid, pass);
+                    canvas.fillScreen(0);
+                    if (success) {
+                        canvas.getTextBounds("Connected!", 0, 0, &x1, &y1, &w, &h);
+                        canvas.setCursor((SCREEN_WIDTH - w) / 2, 28);
+                        canvas.println("Connected!");
+                    } else {
+                        canvas.getTextBounds("Failed!", 0, 0, &x1, &y1, &w, &h);
+                        canvas.setCursor((SCREEN_WIDTH - w) / 2, 28);
+                        canvas.println("Failed!");
+                    }
+                    canvasDisplay();
+                    delay(2000);
+                }
+
+                // Kembali ke main menu setelah selesai konek atau batal
+                menuState = 0;
+                menuIndex = 0;
+                drawMenu();
             }
-            yield();
-          }
-          Serial.println(); // Newline setelah bintang-bintang
-          
-          pass.trim();
-          if(pass.length() > 0) {
-              canvas.fillScreen(0);
-              int16_t x1, y1; uint16_t w, h;
-              canvas.getTextBounds("Connecting...", 0, 0, &x1, &y1, &w, &h);
-              canvas.setCursor((SCREEN_WIDTH - w)/2, 28);
-              canvas.println("Connecting...");
-              canvasDisplay();
-              
-              bool success = connectToNewWiFi(ssid, pass);
-              canvas.fillScreen(0);
-              if(success) {
-                  canvas.getTextBounds("Connected!", 0, 0, &x1, &y1, &w, &h);
-                  canvas.setCursor((SCREEN_WIDTH - w)/2, 28);
-                  canvas.println("Connected!");
-              } else {
-                  canvas.getTextBounds("Failed!", 0, 0, &x1, &y1, &w, &h);
-                  canvas.setCursor((SCREEN_WIDTH - w)/2, 28);
-                  canvas.println("Failed!");
-              }
-              canvasDisplay();
-              delay(2000);
-          }
-          
-          // Kembali ke main menu setelah selesai konek atau batal
-          menuState = 0;
-          menuIndex = 0;
-          drawMenu();
         }
-      }
     }
-  }
-
+}

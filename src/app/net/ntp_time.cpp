@@ -1,11 +1,5 @@
-#ifndef NTP_TIME_H
-#define NTP_TIME_H
+#include "ntp_time.h"
 
-#include <Arduino.h>
-#include <WiFi.h>
-#include <time.h>
-
-// NTP Server - pakai IP langsung untuk skip DNS resolution (lebih cepat!)
 const char* ntpServer1 = "162.159.200.1";  // Cloudflare time server
 const char* ntpServer2 = "216.239.35.0";   // Google time server
 const char* ntpServer3 = "132.163.96.5";   // NIST time server
@@ -42,53 +36,50 @@ void syncNTP() {
 }
 
 bool connectToNewWiFi(String ssid, String pass) {
-  Serial.print("Menghubungkan ke ");
-  Serial.println(ssid);
+    Serial.print("Menghubungkan ke ");
+    Serial.println(ssid);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), pass.c_str());
 
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 30) {
-    delay(500);
-    Serial.print(".");
-    retry++;
-  }
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 30) {
+        delay(500);
+        Serial.print(".");
+        retry++;
+    }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi terhubung!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-    syncNTP();
-    WiFi.mode(WIFI_OFF);
-    return true;
-  } else {
-    Serial.println("\nGagal. Password salah atau sinyal lemah.");
-    WiFi.mode(WIFI_OFF);
-    return false;
-  }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi terhubung!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        syncNTP();
+        WiFi.mode(WIFI_OFF);
+        return true;
+    } else {
+        Serial.println("\nGagal. Password salah atau sinyal lemah.");
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
 }
 
 // Mengambil string tanggal. Langsung baca dari RTC internal ESP32.
 // Tidak perlu WiFi setelah NTP pertama kali sync.
 String getDateStr() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "No RTC";
-  char dateStr[20];
-  strftime(dateStr, sizeof(dateStr), "%a %d, %m, %Y", &timeinfo);
-  return String(dateStr);
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return "No RTC";
+    char dateStr[20];
+    strftime(dateStr, sizeof(dateStr), "%a %d, %m, %Y", &timeinfo);
+    return String(dateStr);
 }
 
 // Mengambil string jam HH:MM:SS langsung dari RTC internal ESP32.
 String getTimeStr() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "--:--:--";
-  char timeStr[10];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
-  return String(timeStr);
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return "--:--:--";
+    char timeStr[10];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+    return String(timeStr);
 }
-
-#endif
-
