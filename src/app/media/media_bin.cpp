@@ -1,6 +1,7 @@
 #include "media_bin.h"
 #include "../core/app_state.h"
 #include "../ui/ui_canvas.h"
+#include "../ui/backlight.h"
 #include "../input/input.h"
 
 #define QOI_MALLOC(sz) ps_malloc(sz)
@@ -213,7 +214,7 @@ void showBinFile(String filename) {
 
     Serial.println("MEDIA: done. Tahan BOOT 500ms = kembali.");
     resetButtonHold();
-    while (true) { delay(10); if (readButtonHeld()) break; }
+    while (true) { delay(10); backlightUpdate(); if (readButtonHeld()) break; }
     display.fillScreen(GC9A01A_BLACK);
 }
 
@@ -370,6 +371,8 @@ void playBinFrames(String selection) {
     uint32_t nextFrameTime = millis();
 
     while (!exitBin) {
+        backlightUpdate(); // Auto-dim backlight
+
         if (totalLoadedFrames > 0) {
             display.drawRGBBitmap(0, 0, psramFrames[currentFrame], 240, 240);
             currentFrame = (currentFrame + 1) % totalLoadedFrames;

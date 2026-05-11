@@ -6,6 +6,7 @@
 #include "app/media/media_gif.h"
 #include "app/clock/clock_lvgl.h"
 #include "app/net/web_uploader.h"
+#include "app/ui/backlight.h"
 #include "app/net/ntp_time.h"
 #include "SpotifyRemote.h"
 
@@ -34,8 +35,6 @@ void setup() {
     setCpuFrequencyMhz(160); // Boost to 160MHz for better stability
     display.setRotation(0);
     display.fillScreen(GC9A01A_BLACK);
-
-    setContrast(CONTRAST_FULL);
 
     // Initialize LVGL
     lv_init();
@@ -89,6 +88,9 @@ void setup() {
         Serial.printf("[SD] Total: %lluMB | Used: %lluMB\n", SD.totalBytes()/(1024*1024), SD.usedBytes()/(1024*1024));
     }
 
+    // Initialize backlight PWM AFTER SPI + SD card are fully stable
+    backlightInit();
+
     listFolders();
     drawMenu();
 
@@ -96,6 +98,9 @@ void setup() {
 }
 
 void loop() {
+    // Auto-dim backlight after idle timeout
+    backlightUpdate();
+
     // ============================================================
     // AUTO-SYNC NTP: Non-blocking 3-state machine
     //   State 0 = IDLE (tunggu interval)
@@ -106,6 +111,7 @@ void loop() {
 
     bool nextTriggered = false;
     bool enterTriggered = false;
+    bool holdTriggered = readButtonHeld();
 
     int btn = readButtonState();
     if (btn == 1) {
@@ -128,6 +134,25 @@ void loop() {
         } else if (menuState == 3) {
             menuIndex++;
             if (menuIndex >= wifiCount) menuIndex = 0;
+        } else if (menuState == 4) {
+            menuIndex++;
+            if (menuIndex >= 2) menuIndex = 0; // 2 settings available
+        } else if (menuState == 5) {
+            if (menuIndex == 0) {
+                uint8_t current = getLowBrightnessLevel();
+                if (current == 10) current = 30;
+                else if (current == 30) current = 50;
+                else if (current == 50) current = 70;
+                else current = 10;
+                setLowBrightnessLevel(current);
+            } else if (menuIndex == 1) {
+                uint16_t current = getDimTimeout();
+                if (current == 10) current = 30;
+                else if (current == 30) current = 60;
+                else if (current == 60) current = 120;
+                else current = 10;
+                setDimTimeout(current);
+            }
         }
         drawMenu();
     }
@@ -180,6 +205,7 @@ void loop() {
 
                 display.fillScreen(GC9A01A_BLACK);
                 while (true) {
+                    backlightUpdate(); // Auto-dim backlight
                     if (readButtonHeld()) break;
                     int spotifyBtn = readButtonState();
                     if (SpotifyRemote.update(spotifyBtn, spotifyCanvas)) {
@@ -197,6 +223,11 @@ void loop() {
                 menuIndex = 0;
                 drawMenu();
             } else if (menuIndex == 6) {
+                // Settings
+                menuState = 4;
+                menuIndex = 0;
+                drawMenu();
+            } else if (menuIndex == 7) {
                 // Format SD Card
                 canvas.fillScreen(0);
                 canvas.setTextSize(1);
@@ -256,7 +287,7 @@ void loop() {
                 menuState = 0;
                 menuIndex = 0;
                 drawMenu();
-            } else if (menuIndex == 7) {
+            } else if (menuIndex == 8) {
                 // Reset System
                 canvas.fillScreen(0);
                 canvas.setTextSize(1);
@@ -425,6 +456,20 @@ void loop() {
                 menuIndex = 0;
                 drawMenu();
             }
+        } else if (menuState == 4) {
+            menuState = 5;
+            drawMenu();
+        }
+    }
+
+    if (holdTriggered) {
+        if (menuState == 4) {
+            menuState = 0;
+            menuIndex = 6; // Return to Settings item in main menu
+            drawMenu();
+        } else if (menuState == 5) {
+            menuState = 4;
+            drawMenu();
         }
     }
 }

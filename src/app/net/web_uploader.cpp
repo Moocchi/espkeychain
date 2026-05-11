@@ -1,6 +1,7 @@
 #include "web_uploader.h"
 #include "../core/app_state.h"
 #include "../ui/ui_canvas.h"
+#include "../ui/backlight.h"
 #include "../input/input.h"
 
 // ===================================
@@ -296,6 +297,7 @@ void runMediaUploaderServer() {
     String ip = WiFi.softAPIP().toString();
 
     while (true) {
+        backlightUpdate(); // Auto-dim backlight
         dnsServer.processNextRequest();
         server.handleClient();
 

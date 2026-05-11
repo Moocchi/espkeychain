@@ -1,6 +1,7 @@
 #include "media_gif.h"
 #include "../core/app_state.h"
 #include "../ui/ui_canvas.h"
+#include "../ui/backlight.h"
 #include "../input/input.h"
 
 // --- GIF PLAYBACK (SD -> AnimatedGIF -> TFT) ---
@@ -605,6 +606,8 @@ void showGifFile(String filename) {
     uint32_t renderedFrames = 0;
 
     while (!exitGif) {
+        backlightUpdate(); // Auto-dim backlight
+
         // Tetap polling tombol tiap iterasi frame agar hold bisa terdeteksi
         // walau tidak ada waktu tunggu (mis. decode lambat, waitMs = 0).
         if (readButtonHeld()) {

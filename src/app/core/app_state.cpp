@@ -19,10 +19,11 @@ String mainMenuList[] = {
     "Wifi Scan",
     "Up Media",
     "Spotify Remote",
+    "Settings",
     "Format SD",
     "Reset System"
 };
-int mainMenuCount = 8;
+int mainMenuCount = 9;
 
 String wifiList[20];
 int wifiCount = 0;

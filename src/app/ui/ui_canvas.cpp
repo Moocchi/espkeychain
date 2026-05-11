@@ -1,6 +1,7 @@
 #include "ui_canvas.h"
 #include "../core/app_state.h"
 #include "../input/input.h"
+#include "backlight.h"
 
 static uint16_t canvasColors[SCREEN_WIDTH * SCREEN_HEIGHT];
 
@@ -108,6 +109,41 @@ void drawMenu() {
             String s = wifiList[i];
             if (s.length() > 18) s = s.substring(0, 18);
             canvas.print(s);
+        }
+    } else if (menuState == 4 || menuState == 5) {
+        // Settings Menu
+        String title = "=== SETTINGS ===";
+        int16_t x1, y1; uint16_t w, h;
+        canvas.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+        canvas.setCursor((SCREEN_WIDTH - w) / 2, 0);
+        canvas.println(title);
+
+        // Setting 0: Low Brightness
+        canvas.setCursor(0, 15);
+        if (menuIndex == 0) canvas.print("> ");
+        else canvas.print("  ");
+        canvas.print("Low Bright: ");
+        if (menuState == 5 && menuIndex == 0) canvas.print("[");
+        canvas.print(getLowBrightnessLevel());
+        if (menuState == 5 && menuIndex == 0) canvas.print("]");
+
+        // Setting 1: Dim After
+        canvas.setCursor(0, 25);
+        if (menuIndex == 1) canvas.print("> ");
+        else canvas.print("  ");
+        canvas.print("Dim After: ");
+        if (menuState == 5 && menuIndex == 1) canvas.print("[");
+        canvas.print(getDimTimeout());
+        canvas.print("s");
+        if (menuState == 5 && menuIndex == 1) canvas.print("]");
+
+        canvas.setCursor(0, 45);
+        if (menuState == 5) {
+            canvas.println("1x: Ubah | Hold: Save");
+        } else {
+            canvas.println("1x: Pindah | 2x: Edit");
+            canvas.setCursor(0, 55);
+            canvas.println("Hold: Back");
         }
     }
 

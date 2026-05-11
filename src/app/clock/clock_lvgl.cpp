@@ -2,6 +2,7 @@
 #include "../core/app_state.h"
 #include "../input/input.h"
 #include "../ui/lvgl_clock.h"
+#include "../ui/backlight.h"
 #include "../net/ntp_time.h"
 
 // LVGL Flush function
@@ -48,6 +49,7 @@ void runRealtimeClock() {
 
     while (true) {
         uint32_t now = millis();
+        backlightUpdate(); // Auto-dim backlight
         if (readButtonHeld()) break; // Tahan tombol exit
 
         // --- BACKGROUND LOGIC ---

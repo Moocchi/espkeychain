@@ -1,4 +1,5 @@
 #include "input.h"
+#include "../ui/backlight.h"
 
 static uint32_t lastClickTime = 0;
 static bool buttonState = !TOUCH_ACTIVE_STATE;
@@ -19,6 +20,7 @@ void resetButtonHold() {
 bool readButtonHeld() {
     bool pressed = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE_STATE);
     if (pressed) {
+        backlightWake(); // Wake backlight on any touch
         if (btnHoldStart == 0) {
             btnHoldStart = millis();
             btnHoldFired = false;
@@ -49,6 +51,7 @@ int readButtonState() {
             buttonState = reading;
 
             if (buttonState == TOUCH_ACTIVE_STATE) {
+                backlightWake(); // Wake backlight on confirmed touch
                 if (now - lastClickTime < DOUBLE_CLICK_GAP) {
                     action = 2;
                     lastClickTime = 0;
