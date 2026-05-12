@@ -4,7 +4,7 @@
 static uint32_t lastClickTime = 0;
 static bool buttonState = !TOUCH_ACTIVE_STATE;
 static bool lastButtonState = !TOUCH_ACTIVE_STATE;
-static const uint32_t DOUBLE_CLICK_GAP = 250;
+static const uint32_t DOUBLE_CLICK_GAP = 400;
 static const uint32_t DEBOUNCE_DELAY = 50;
 static uint32_t lastDebounceTime = 0;
 

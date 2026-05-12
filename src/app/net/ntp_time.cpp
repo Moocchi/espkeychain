@@ -1,4 +1,5 @@
 #include "ntp_time.h"
+#include <Preferences.h>
 
 const char* ntpServer1 = "162.159.200.1";  // Cloudflare time server
 const char* ntpServer2 = "216.239.35.0";   // Google time server
@@ -55,11 +56,23 @@ bool connectToNewWiFi(String ssid, String pass) {
         Serial.println("\nWiFi terhubung!");
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
+
+        Preferences prefs;
+        prefs.begin("sys", false);
+        prefs.putBool("wifi_ready", true);
+        prefs.putString("wifi_ssid", ssid);
+        prefs.putString("wifi_pass", pass);
+        prefs.end();
+
         syncNTP();
+        WiFi.disconnect(true);
+        delay(100);
         WiFi.mode(WIFI_OFF);
         return true;
     } else {
         Serial.println("\nGagal. Password salah atau sinyal lemah.");
+        WiFi.disconnect(true);
+        delay(100);
         WiFi.mode(WIFI_OFF);
         return false;
     }

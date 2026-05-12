@@ -2,6 +2,7 @@
 #include "../core/app_state.h"
 #include "../input/input.h"
 #include "backlight.h"
+#include <Preferences.h>
 
 static uint16_t canvasColors[SCREEN_WIDTH * SCREEN_HEIGHT];
 
@@ -34,6 +35,24 @@ void drawMenu() {
         canvas.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
         canvas.setCursor((SCREEN_WIDTH - w) / 2, 0);
         canvas.println(title);
+
+        // WiFi On-Demand Indicator (shows if we have saved credentials)
+        Preferences prefs;
+        prefs.begin("sys", true); // read-only
+        bool wifiReady = prefs.getBool("wifi_ready", false);
+        prefs.end();
+
+        if (wifiReady) {
+            // Draw a visible WiFi icon (3 nested arcs using pixels or simple shapes)
+            int wx = SCREEN_WIDTH - 15;
+            int wy = 5;
+            canvas.drawCircle(wx, wy, 1, 1);
+            canvas.drawCircle(wx, wy, 4, 1);
+            canvas.drawCircle(wx, wy, 7, 1);
+            // Optional: draw a text instead to be clearly visible
+            // canvas.setCursor(wx - 2, wy + 2);
+            // canvas.print("W");
+        }
 
         int startObj = menuIndex - 4;
         if (startObj < 0) startObj = 0;

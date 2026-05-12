@@ -7,6 +7,7 @@
 #include "app/clock/clock_lvgl.h"
 #include "app/net/web_uploader.h"
 #include "app/ui/backlight.h"
+#include "app/chat/mqtt_chat.h"
 #include "app/net/ntp_time.h"
 #include "SpotifyRemote.h"
 
@@ -223,11 +224,16 @@ void loop() {
                 menuIndex = 0;
                 drawMenu();
             } else if (menuIndex == 6) {
+                // Chat MQTT
+                runMqttChat();
+                display.fillScreen(GC9A01A_BLACK);
+                drawMenu();
+            } else if (menuIndex == 7) {
                 // Settings
                 menuState = 4;
                 menuIndex = 0;
                 drawMenu();
-            } else if (menuIndex == 7) {
+            } else if (menuIndex == 8) {
                 // Format SD Card
                 canvas.fillScreen(0);
                 canvas.setTextSize(1);
@@ -287,7 +293,7 @@ void loop() {
                 menuState = 0;
                 menuIndex = 0;
                 drawMenu();
-            } else if (menuIndex == 8) {
+            } else if (menuIndex == 9) {
                 // Reset System
                 canvas.fillScreen(0);
                 canvas.setTextSize(1);
@@ -465,7 +471,7 @@ void loop() {
     if (holdTriggered) {
         if (menuState == 4) {
             menuState = 0;
-            menuIndex = 6; // Return to Settings item in main menu
+            menuIndex = 7; // Return to Settings item in main menu
             drawMenu();
         } else if (menuState == 5) {
             menuState = 4;
